@@ -13,6 +13,7 @@
 //! managing a single connection and all the related state (such as streams).
 
 #![cfg_attr(not(fuzzing), warn(missing_docs))]
+#![allow(unexpected_cfgs)]
 #![cfg_attr(test, allow(dead_code))]
 // Fixes welcome:
 #![warn(unreachable_pub)]
@@ -59,8 +60,10 @@ mod config;
 #[cfg(feature = "qlog")]
 pub use config::QlogConfig;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
-    ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
+    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout,
+    InitialFrameElementConfig, InitialFrameLayoutConfig, InitialPacketLayoutConfig,
+    MtuDiscoveryConfig, ServerConfig, StdSystemTime, TimeSource, TransportConfig,
+    ValidationTokenConfig,
 };
 
 pub mod crypto;

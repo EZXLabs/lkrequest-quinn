@@ -454,6 +454,7 @@ impl EndpointInner {
         respond(transmit, &response_buffer, &*state.socket);
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
         let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();

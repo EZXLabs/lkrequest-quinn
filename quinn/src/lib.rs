@@ -63,6 +63,7 @@ pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
     ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
+    InitialFrameElementConfig, InitialFrameLayoutConfig, InitialPacketLayoutConfig,
     MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
     StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
     TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,

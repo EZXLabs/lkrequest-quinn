@@ -20,7 +20,7 @@ use tracing::{debug, error, trace, warn};
 use crate::{
     Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
     Side, Transmit, TransportConfig, TransportError,
-    cid_generator::ConnectionIdGenerator,
+    cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
     connection::{Connection, ConnectionError, SideArgs},
@@ -352,7 +352,10 @@ impl Endpoint {
             return Err(ConnectError::UnsupportedVersion);
         }
 
-        let remote_id = (config.initial_dst_cid_provider)();
+        let remote_id = match self.config.initial_destination_cid_len {
+            Some(len) => RandomConnectionIdGenerator::new(len).generate_cid(),
+            None => (config.initial_dst_cid_provider)(),
+        };
         trace!(initial_dcid = %remote_id);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
@@ -363,7 +366,6 @@ impl Endpoint {
             self.local_cid_generator.as_ref(),
             loc_cid,
             None,
-            &mut self.rng,
         );
         let tls = config
             .crypto
@@ -625,7 +627,6 @@ impl Endpoint {
             self.local_cid_generator.as_ref(),
             loc_cid,
             Some(&server_config),
-            &mut self.rng,
         );
         params.stateless_reset_token = Some(ResetToken::new(&*self.config.reset_key, loc_cid));
         params.original_dst_cid = Some(incoming.token.orig_dst_cid);
@@ -741,6 +742,7 @@ impl Endpoint {
     /// Respond with a retry packet, requiring the client to retry with address validation
     ///
     /// Errors if `incoming.may_retry()` is false.
+    #[allow(clippy::result_large_err)]
     pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
         if !incoming.may_retry() {
             return Err(RetryError(Box::new(incoming)));

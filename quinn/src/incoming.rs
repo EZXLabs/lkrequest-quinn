@@ -49,6 +49,7 @@ impl Incoming {
     /// Respond with a retry packet, requiring the client to retry with address validation
     ///
     /// Errors if `may_retry()` is false.
+    #[allow(clippy::result_large_err)]
     pub fn retry(mut self) -> Result<(), RetryError> {
         let state = self.0.take().unwrap();
         state.endpoint.retry(state.inner).map_err(|e| {

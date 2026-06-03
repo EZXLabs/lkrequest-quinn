@@ -8,7 +8,6 @@ repository.workspace = true
 description = "UDP sockets with ECN information for the QUIC transport protocol"
 keywords.workspace = true
 categories.workspace = true
-workspace = ".."
 
 [features]
 # NOTE: Please keep this in sync with the feature list in `.github/workflows/codecov.yml`, see

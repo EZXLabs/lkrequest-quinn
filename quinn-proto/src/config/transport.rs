@@ -1,6 +1,8 @@
 use std::{fmt, sync::Arc};
+
 #[cfg(feature = "qlog")]
 use std::{io, sync::Mutex, time::Instant};
+use thiserror::Error;
 
 #[cfg(feature = "qlog")]
 use qlog::streamer::QlogStreamer;
@@ -37,10 +39,13 @@ pub struct TransportConfig {
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
+    pub(crate) initial_datagram_size: u16,
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
+    pub(crate) enable_ecn: bool,
+    pub(crate) initial_frame_layout: Option<InitialFrameLayoutConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
@@ -48,6 +53,10 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
+    pub(crate) send_reserved_transport_parameter: bool,
+    pub(crate) send_min_ack_delay_transport_parameter: bool,
+    pub(crate) extra_transport_parameters: Vec<(VarInt, Vec<u8>)>,
+    pub(crate) transport_parameter_order: Vec<VarInt>,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -192,6 +201,16 @@ impl TransportConfig {
         self
     }
 
+    /// Minimum UDP payload size for padded Initial datagrams.
+    ///
+    /// QUIC requires padded Initial datagrams to be at least 1200 bytes. Some
+    /// browser profiles consistently pad them higher while still staying below
+    /// the initial path MTU.
+    pub fn initial_datagram_size(&mut self, value: u16) -> &mut Self {
+        self.initial_datagram_size = value.clamp(INITIAL_MTU, MAX_UDP_PAYLOAD);
+        self
+    }
+
     pub(crate) fn get_initial_mtu(&self) -> u16 {
         self.initial_mtu.max(self.min_mtu)
     }
@@ -308,6 +327,74 @@ impl TransportConfig {
         self
     }
 
+    /// Whether to send Quinn's default reserved transport parameter.
+    ///
+    /// Quinn sends a reserved parameter by default to exercise peer handling
+    /// of unknown transport parameters. Browser fingerprint profiles may
+    /// disable this and inject their own observed reserved parameter instead.
+    pub fn send_reserved_transport_parameter(&mut self, enabled: bool) -> &mut Self {
+        self.send_reserved_transport_parameter = enabled;
+        self
+    }
+
+    /// Whether to advertise the QUIC ACK Frequency `min_ack_delay` transport parameter.
+    ///
+    /// Quinn defaults this to `true` for its ACK Frequency implementation.
+    /// Some browser profiles do not send this parameter and can disable it for
+    /// closer wire compatibility.
+    pub fn send_min_ack_delay_transport_parameter(&mut self, enabled: bool) -> &mut Self {
+        self.send_min_ack_delay_transport_parameter = enabled;
+        self
+    }
+
+    /// Whether to mark outgoing UDP datagrams with ECN ECT(0).
+    ///
+    /// Quinn defaults this to `true`. Some browser captures, including the
+    /// Chrome QUIC profile used by this crate, send Not-ECT Initial datagrams.
+    pub fn enable_ecn(&mut self, enabled: bool) -> &mut Self {
+        self.enable_ecn = enabled;
+        self
+    }
+
+    /// Optional frame-level layout for the first client Initial packets.
+    ///
+    /// This is intended for browser fingerprint experiments that need to
+    /// reproduce captured CRYPTO fragmentation and interleaved PING/PADDING
+    /// frames. When set, templates apply only to client Initial packet numbers
+    /// listed in the layout; all other packets use Quinn's regular scheduler.
+    pub fn initial_frame_layout(&mut self, layout: Option<InitialFrameLayoutConfig>) -> &mut Self {
+        self.initial_frame_layout = layout;
+        self
+    }
+
+    /// Extra QUIC transport parameters to advertise during the TLS handshake.
+    ///
+    /// This is intended for fingerprint/profile compatibility experiments such
+    /// as `version_information` and Chromium private parameters. Parameters
+    /// encoded directly by Quinn are rejected to avoid malformed duplicate
+    /// entries.
+    pub fn extra_transport_parameters(
+        &mut self,
+        parameters: Vec<(VarInt, Vec<u8>)>,
+    ) -> Result<&mut Self, ExtraTransportParameterError> {
+        validate_extra_transport_parameters(&parameters)?;
+        self.extra_transport_parameters = parameters;
+        Ok(self)
+    }
+
+    /// Preferred wire order for local transport parameters.
+    ///
+    /// IDs present here are emitted first, if their value is active. Any
+    /// remaining active parameters are appended in Quinn's default order.
+    pub fn transport_parameter_order(
+        &mut self,
+        order: Vec<VarInt>,
+    ) -> Result<&mut Self, TransportParameterOrderError> {
+        validate_transport_parameter_order(&order)?;
+        self.transport_parameter_order = order;
+        Ok(self)
+    }
+
     /// Whether to force every packet number to be used
     ///
     /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
@@ -382,10 +469,13 @@ impl Default for TransportConfig {
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
+            initial_datagram_size: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
             ack_frequency_config: None,
+            enable_ecn: true,
+            initial_frame_layout: None,
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
@@ -393,6 +483,10 @@ impl Default for TransportConfig {
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
+            send_reserved_transport_parameter: true,
+            send_min_ack_delay_transport_parameter: true,
+            extra_transport_parameters: Vec::new(),
+            transport_parameter_order: Vec::new(),
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -419,16 +513,23 @@ impl fmt::Debug for TransportConfig {
             time_threshold,
             initial_rtt,
             initial_mtu,
+            initial_datagram_size,
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
             ack_frequency_config,
+            enable_ecn,
+            initial_frame_layout,
             persistent_congestion_threshold,
             keep_alive_interval,
             crypto_buffer_size,
             allow_spin,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
+            send_reserved_transport_parameter,
+            send_min_ack_delay_transport_parameter,
+            extra_transport_parameters,
+            transport_parameter_order,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -448,10 +549,13 @@ impl fmt::Debug for TransportConfig {
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)
+            .field("initial_datagram_size", initial_datagram_size)
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
+            .field("enable_ecn", enable_ecn)
+            .field("initial_frame_layout", initial_frame_layout)
             .field(
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,
@@ -461,6 +565,16 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
+            .field(
+                "send_reserved_transport_parameter",
+                send_reserved_transport_parameter,
+            )
+            .field(
+                "send_min_ack_delay_transport_parameter",
+                send_min_ack_delay_transport_parameter,
+            )
+            .field("extra_transport_parameters", extra_transport_parameters)
+            .field("transport_parameter_order", transport_parameter_order)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload);
         if cfg!(feature = "qlog") {
@@ -469,6 +583,116 @@ impl fmt::Debug for TransportConfig {
 
         s.finish_non_exhaustive()
     }
+}
+
+/// Frame-level layout for the first client Initial packets.
+///
+/// Packet numbers are zero-based within the Initial packet number space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialFrameLayoutConfig {
+    /// Target UDP payload size for padded Initial datagrams.
+    pub target_udp_payload_size: u16,
+    /// Ordered packet templates to apply.
+    pub packets: Vec<InitialPacketLayoutConfig>,
+}
+
+/// Frame template for one client Initial packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialPacketLayoutConfig {
+    /// Zero-based Initial packet number.
+    pub packet_number: u64,
+    /// Ordered frame elements to encode.
+    pub frames: Vec<InitialFrameElementConfig>,
+}
+
+/// One frame element in an Initial packet layout template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitialFrameElementConfig {
+    /// CRYPTO frame with the given handshake stream offset and length.
+    Crypto {
+        /// CRYPTO stream offset.
+        offset: u64,
+        /// Number of CRYPTO bytes to copy from the pending handshake data.
+        length: usize,
+    },
+    /// A run of PADDING bytes.
+    Padding {
+        /// Number of zero-valued PADDING frame bytes.
+        length: usize,
+    },
+    /// A PING frame.
+    Ping,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ExtraTransportParameterError {
+    #[error("transport parameter {0:#x} is already encoded by Quinn")]
+    LocallyEncoded(u64),
+    #[error("duplicate extra transport parameter {0:#x}")]
+    Duplicate(u64),
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum TransportParameterOrderError {
+    #[error("duplicate transport parameter order entry {0:#x}")]
+    Duplicate(u64),
+}
+
+fn validate_extra_transport_parameters(
+    parameters: &[(VarInt, Vec<u8>)],
+) -> Result<(), ExtraTransportParameterError> {
+    let mut seen = Vec::with_capacity(parameters.len());
+    for (id, _) in parameters {
+        let value = id.into_inner();
+        if is_locally_encoded_transport_parameter(value) {
+            return Err(ExtraTransportParameterError::LocallyEncoded(value));
+        }
+        if seen.contains(&value) {
+            return Err(ExtraTransportParameterError::Duplicate(value));
+        }
+        seen.push(value);
+    }
+    Ok(())
+}
+
+fn validate_transport_parameter_order(
+    order: &[VarInt],
+) -> Result<(), TransportParameterOrderError> {
+    let mut seen = Vec::with_capacity(order.len());
+    for id in order {
+        let value = id.into_inner();
+        if seen.contains(&value) {
+            return Err(TransportParameterOrderError::Duplicate(value));
+        }
+        seen.push(value);
+    }
+    Ok(())
+}
+
+fn is_locally_encoded_transport_parameter(id: u64) -> bool {
+    matches!(
+        id,
+        0x00 | 0x01
+            | 0x02
+            | 0x03
+            | 0x04
+            | 0x05
+            | 0x06
+            | 0x07
+            | 0x08
+            | 0x09
+            | 0x0a
+            | 0x0b
+            | 0x0c
+            | 0x0d
+            | 0x0e
+            | 0x0f
+            | 0x10
+            | 0x20
+            | 0xb6
+            | 0x2ab2
+            | 0xff04de1a
+    )
 }
 
 /// Parameters for controlling the peer's acknowledgement frequency

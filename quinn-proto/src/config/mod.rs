@@ -28,7 +28,10 @@ use crate::{
 mod transport;
 #[cfg(feature = "qlog")]
 pub use transport::QlogConfig;
-pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+pub use transport::{
+    AckFrequencyConfig, IdleTimeout, InitialFrameElementConfig, InitialFrameLayoutConfig,
+    InitialPacketLayoutConfig, MtuDiscoveryConfig, TransportConfig,
+};
 
 /// Global configuration for the endpoint, affecting all connections
 ///
@@ -44,6 +47,11 @@ pub struct EndpointConfig {
         Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
     pub(crate) supported_versions: Vec<u32>,
     pub(crate) grease_quic_bit: bool,
+    /// Length of the random destination connection ID for client Initial packets.
+    ///
+    /// `None` falls back to each `ClientConfig`'s `initial_dst_cid_provider`. Browser
+    /// fingerprint profiles set this to match an observed client Initial DCID length.
+    pub(crate) initial_destination_cid_len: Option<usize>,
     /// Minimum interval between outgoing stateless reset packets
     pub(crate) min_reset_interval: Duration,
     /// Optional seed to be used internally for random number generation
@@ -61,6 +69,7 @@ impl EndpointConfig {
             connection_id_generator_factory: Arc::new(cid_factory),
             supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),
             grease_quic_bit: true,
+            initial_destination_cid_len: None,
             min_reset_interval: Duration::from_millis(20),
             rng_seed: None,
         }
@@ -132,6 +141,18 @@ impl EndpointConfig {
     pub fn grease_quic_bit(&mut self, value: bool) -> &mut Self {
         self.grease_quic_bit = value;
         self
+    }
+
+    /// Length of the random destination connection ID used in client Initial packets.
+    ///
+    /// Defaults to each [`ClientConfig`]'s `initial_dst_cid_provider`. Browser fingerprint
+    /// profiles can set this to match an observed client Initial DCID length.
+    pub fn initial_destination_cid_len(&mut self, value: usize) -> Result<&mut Self, ConfigError> {
+        if value > MAX_CID_SIZE {
+            return Err(ConfigError::OutOfBounds);
+        }
+        self.initial_destination_cid_len = Some(value);
+        Ok(self)
     }
 
     /// Minimum interval between outgoing stateless reset packets

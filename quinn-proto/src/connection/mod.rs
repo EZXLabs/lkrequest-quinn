@@ -21,7 +21,10 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
-    config::{ServerConfig, TransportConfig},
+    config::{
+        InitialFrameElementConfig, InitialFrameLayoutConfig, InitialPacketLayoutConfig,
+        ServerConfig, TransportConfig,
+    },
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -524,6 +527,15 @@ impl Connection {
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
+        let configured_initial_datagram_size = self.config.initial_frame_layout.as_ref().map_or(
+            self.config.initial_datagram_size,
+            |layout| {
+                self.config
+                    .initial_datagram_size
+                    .max(layout.target_udp_payload_size)
+            },
+        );
+        let initial_datagram_size = configured_initial_datagram_size.min(self.path.current_mtu());
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -641,7 +653,12 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(MIN_INITIAL_SIZE);
+                        let pad_to = if builder.space == SpaceId::Initial {
+                            initial_datagram_size
+                        } else {
+                            MIN_INITIAL_SIZE
+                        };
+                        builder.pad_to(pad_to);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -921,7 +938,12 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(MIN_INITIAL_SIZE);
+                let pad_to = if builder.space == SpaceId::Initial {
+                    initial_datagram_size
+                } else {
+                    MIN_INITIAL_SIZE
+                };
+                builder.pad_to(pad_to);
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
@@ -3162,6 +3184,11 @@ impl Connection {
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
+        let initial_frame_layout = if space_id == SpaceId::Initial && self.side.is_client() {
+            self.config.initial_frame_layout.clone()
+        } else {
+            None
+        };
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3263,8 +3290,21 @@ impl Connection {
             }
         }
 
+        let initial_layout_applied = Self::populate_initial_frame_layout_packet(
+            initial_frame_layout.as_ref(),
+            space,
+            buf,
+            max_size,
+            pn,
+            &mut sent,
+            &mut self.stats,
+        );
+
         // CRYPTO
-        while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
+        while !initial_layout_applied
+            && buf.len() + frame::Crypto::SIZE_BOUND < max_size
+            && !is_0rtt
+        {
             let mut frame = match space.pending.crypto.pop_front() {
                 Some(x) => x,
                 None => break,
@@ -3436,6 +3476,194 @@ impl Connection {
         }
 
         sent
+    }
+
+    fn populate_initial_frame_layout_packet(
+        layout: Option<&InitialFrameLayoutConfig>,
+        space: &mut PacketSpace,
+        buf: &mut Vec<u8>,
+        max_size: usize,
+        pn: u64,
+        sent: &mut SentFrames,
+        stats: &mut ConnectionStats,
+    ) -> bool {
+        let layout = match layout {
+            Some(layout) => layout,
+            None => return false,
+        };
+        let packet = match layout
+            .packets
+            .iter()
+            .find(|packet| packet.packet_number == pn)
+        {
+            Some(packet) => packet,
+            None => return false,
+        };
+        let crypto_source = match Self::initial_layout_crypto_source(space) {
+            Some(crypto_source) => crypto_source,
+            None => return false,
+        };
+
+        let frame_bytes = match Self::initial_layout_payload_len(packet) {
+            Some(frame_bytes) => frame_bytes,
+            None => return false,
+        };
+        if buf
+            .len()
+            .checked_add(frame_bytes)
+            .map_or(true, |end| end > max_size)
+        {
+            return false;
+        }
+        if !Self::initial_layout_crypto_available(packet, &crypto_source) {
+            return false;
+        }
+
+        trace!(packet_number = pn, "applying Initial frame layout profile");
+        for element in &packet.frames {
+            match *element {
+                InitialFrameElementConfig::Crypto { offset, length } => {
+                    let start = offset as usize;
+                    let end = start + length;
+                    let frame = frame::Crypto {
+                        offset,
+                        data: crypto_source.slice(start..end),
+                    };
+                    trace!("CRYPTO: off {} len {}", frame.offset, frame.data.len());
+                    frame.encode(buf);
+                    stats.frame_tx.crypto += 1;
+                    sent.retransmits.get_or_create().crypto.push_back(frame);
+                }
+                InitialFrameElementConfig::Padding { length } => {
+                    buf.resize(buf.len() + length, 0);
+                }
+                InitialFrameElementConfig::Ping => {
+                    trace!("PING");
+                    buf.write(frame::FrameType::PING);
+                    sent.non_retransmits = true;
+                    stats.frame_tx.ping += 1;
+                }
+            }
+        }
+
+        sent.requires_padding = true;
+
+        if Self::is_last_initial_layout_packet(layout, pn) {
+            Self::prune_initial_layout_crypto(space, layout, &crypto_source);
+        }
+
+        true
+    }
+
+    fn initial_layout_crypto_source(space: &PacketSpace) -> Option<Bytes> {
+        let frame = space.pending.crypto.front()?;
+        if frame.offset != 0 {
+            return None;
+        }
+        Some(frame.data.clone())
+    }
+
+    fn initial_layout_payload_len(packet: &InitialPacketLayoutConfig) -> Option<usize> {
+        packet.frames.iter().try_fold(0usize, |total, element| {
+            let len = match *element {
+                InitialFrameElementConfig::Crypto { offset, length } => {
+                    let offset = VarInt::from_u64(offset).ok()?;
+                    let length_var = VarInt::from_u64(length as u64).ok()?;
+                    1usize
+                        .checked_add(offset.size())?
+                        .checked_add(length_var.size())?
+                        .checked_add(length)?
+                }
+                InitialFrameElementConfig::Padding { length } => length,
+                InitialFrameElementConfig::Ping => 1,
+            };
+            total.checked_add(len)
+        })
+    }
+
+    fn initial_layout_crypto_available(
+        packet: &InitialPacketLayoutConfig,
+        crypto_source: &Bytes,
+    ) -> bool {
+        packet.frames.iter().all(|element| match *element {
+            InitialFrameElementConfig::Crypto { offset, length } => {
+                let start = match usize::try_from(offset) {
+                    Ok(start) => start,
+                    Err(_) => return false,
+                };
+                start
+                    .checked_add(length)
+                    .map_or(false, |end| end <= crypto_source.len())
+            }
+            InitialFrameElementConfig::Padding { .. } | InitialFrameElementConfig::Ping => true,
+        })
+    }
+
+    fn is_last_initial_layout_packet(layout: &InitialFrameLayoutConfig, pn: u64) -> bool {
+        layout
+            .packets
+            .iter()
+            .map(|packet| packet.packet_number)
+            .max()
+            == Some(pn)
+    }
+
+    fn prune_initial_layout_crypto(
+        space: &mut PacketSpace,
+        layout: &InitialFrameLayoutConfig,
+        crypto_source: &Bytes,
+    ) {
+        let mut ranges = Vec::new();
+        for packet in &layout.packets {
+            for element in &packet.frames {
+                if let InitialFrameElementConfig::Crypto { offset, length } = *element {
+                    let start = match usize::try_from(offset) {
+                        Ok(start) => start,
+                        Err(_) => return,
+                    };
+                    let end = match start.checked_add(length) {
+                        Some(end) if end <= crypto_source.len() => end,
+                        _ => return,
+                    };
+                    ranges.push(start..end);
+                }
+            }
+        }
+
+        ranges.sort_by_key(|range| range.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut() {
+                if range.start <= last.end {
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+
+        let mut pending = VecDeque::new();
+        let mut cursor = 0usize;
+        for range in merged {
+            if cursor < range.start {
+                pending.push_back(frame::Crypto {
+                    offset: cursor as u64,
+                    data: crypto_source.slice(cursor..range.start),
+                });
+            }
+            cursor = range.end;
+        }
+        if cursor < crypto_source.len() {
+            pending.push_back(frame::Crypto {
+                offset: cursor as u64,
+                data: crypto_source.slice(cursor..),
+            });
+        }
+
+        space.pending.crypto.pop_front();
+        while let Some(frame) = pending.pop_back() {
+            space.pending.crypto.push_front(frame);
+        }
     }
 
     /// Tries to write pending ACKs into a buffer if there is enough space.
