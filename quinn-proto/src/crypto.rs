@@ -49,6 +49,14 @@ pub trait Session: Send + Sync + 'static {
     /// If the 0-RTT-encrypted data has been accepted by the peer
     fn early_data_accepted(&self) -> Option<bool>;
 
+    /// Whether the peer has explicitly rejected 0-RTT before handshake completion.
+    ///
+    /// TLS implementations use this to report HelloRetryRequest immediately so
+    /// queued 0-RTT frames stop being transmitted before the handshake finishes.
+    fn early_data_rejected(&self) -> bool {
+        false
+    }
+
     /// Returns `true` until the connection is fully established.
     fn is_handshaking(&self) -> bool;
 

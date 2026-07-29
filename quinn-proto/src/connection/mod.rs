@@ -189,6 +189,7 @@ pub struct Connection {
     /// spoofing key updates.
     next_crypto: Option<KeyPair<Box<dyn PacketKey>>>,
     accepted_0rtt: bool,
+    rejected_0rtt: bool,
     /// Whether the idle timer should be reset the next time an ack-eliciting packet is transmitted.
     permit_idle_reset: bool,
     /// Negotiated idle timeout
@@ -322,6 +323,7 @@ impl Connection {
             prev_crypto: None,
             next_crypto: None,
             accepted_0rtt: false,
+            rejected_0rtt: false,
             permit_idle_reset: true,
             idle_timeout: match config.max_idle_timeout {
                 None | Some(VarInt(0)) => None,
@@ -2147,22 +2149,33 @@ impl Connection {
             ));
         }
 
-        let space = &mut self.spaces[space];
-        let max = end.saturating_sub(space.crypto_stream.bytes_read());
-        if max > self.config.crypto_buffer_size as u64 {
-            return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
-        }
-
-        space
-            .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len)
-            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
-
-        while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
-            trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
-            if self.crypto.read_handshake(&chunk.bytes)? {
-                self.events.push_back(Event::HandshakeDataReady);
+        let client_with_0rtt = self.side.is_client() && self.zero_rtt_enabled;
+        let mut reject_0rtt = false;
+        {
+            let space = &mut self.spaces[space];
+            let max = end.saturating_sub(space.crypto_stream.bytes_read());
+            if max > self.config.crypto_buffer_size as u64 {
+                return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
             }
+
+            space
+                .crypto_stream
+                .insert(crypto.offset, crypto.data.clone(), payload_len)
+                .map_err(|_| {
+                    TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer")
+                })?;
+
+            while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
+                trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
+                let handshake_data_ready = self.crypto.read_handshake(&chunk.bytes)?;
+                reject_0rtt |= client_with_0rtt && self.crypto.early_data_rejected();
+                if handshake_data_ready {
+                    self.events.push_back(Event::HandshakeDataReady);
+                }
+            }
+        }
+        if reject_0rtt {
+            self.reject_0rtt();
         }
 
         Ok(())
@@ -2606,20 +2619,7 @@ impl Connection {
 
                     if self.has_0rtt() {
                         if !self.crypto.early_data_accepted().unwrap() {
-                            debug_assert!(self.side.is_client());
-                            debug!("0-RTT rejected");
-                            self.accepted_0rtt = false;
-                            self.streams.zero_rtt_rejected();
-
-                            // Discard already-queued frames
-                            self.spaces[SpaceId::Data].pending = Retransmits::default();
-
-                            // Discard 0-RTT packets
-                            let sent_packets =
-                                mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                            for packet in sent_packets.into_values() {
-                                self.remove_in_flight(&packet);
-                            }
+                            self.reject_0rtt();
                         } else {
                             self.accepted_0rtt = true;
                             params.validate_resumption_from(&self.peer_params)?;
@@ -2709,6 +2709,25 @@ impl Connection {
             Header::Short { .. } => unreachable!(
                 "short packets received during handshake are discarded in handle_packet"
             ),
+        }
+    }
+
+    fn reject_0rtt(&mut self) {
+        if self.rejected_0rtt {
+            return;
+        }
+
+        debug_assert!(self.side.is_client());
+        debug!("0-RTT rejected");
+        self.rejected_0rtt = true;
+        self.accepted_0rtt = false;
+        self.streams.zero_rtt_rejected();
+
+        self.spaces[SpaceId::Data].pending = Retransmits::default();
+
+        let sent_packets = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
+        for packet in sent_packets.into_values() {
+            self.remove_in_flight(&packet);
         }
     }
 
