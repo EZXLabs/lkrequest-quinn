@@ -53,6 +53,8 @@ mod datagrams;
 use datagrams::DatagramState;
 pub use datagrams::{Datagrams, SendDatagramError};
 
+mod initial_chaos;
+
 mod mtud;
 mod pacing;
 
@@ -529,14 +531,16 @@ impl Connection {
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
-        let configured_initial_datagram_size = self.config.initial_frame_layout.as_ref().map_or(
-            self.config.initial_datagram_size,
-            |layout| {
+        let configured_initial_datagram_size = self
+            .config
+            .initial_frame_layout
+            .as_ref()
+            .filter(|_| !self.config.initial_packet_chaos || self.side.is_server())
+            .map_or(self.config.initial_datagram_size, |layout| {
                 self.config
                     .initial_datagram_size
                     .max(layout.target_udp_payload_size)
-            },
-        );
+            });
         let initial_datagram_size = configured_initial_datagram_size.min(self.path.current_mtu());
 
         // Iterate over all spaces and find data to send
@@ -590,7 +594,16 @@ impl Connection {
             } else {
                 unreachable!("tried to send {:?} packet without keys", space_id)
             };
-            if !coalesce || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len {
+            let initial_chaos_datagram_full = space_id == SpaceId::Initial
+                && self.side.is_client()
+                && self.config.initial_packet_chaos
+                && builder_storage
+                    .as_ref()
+                    .is_some_and(|builder| builder.space == SpaceId::Initial);
+            if !coalesce
+                || initial_chaos_datagram_full
+                || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len
+            {
                 // We need to send 1 more datagram and extend the buffer for that.
 
                 // Is 1 more datagram allowed?
@@ -905,8 +918,24 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let max_size = if space_id == SpaceId::Initial
+                && self.side.is_client()
+                && self.config.initial_packet_chaos
+            {
+                let target_max = builder
+                    .max_size
+                    .min(datagram_start + usize::from(initial_datagram_size) - builder.tag_len);
+                // A large Retry token can exceed the profile's soft packet
+                // size. Retain enough space for CRYPTO using the path MTU.
+                if target_max.saturating_sub(buf.len()) < MIN_PACKET_SPACE {
+                    builder.max_size
+                } else {
+                    target_max
+                }
+            } else {
+                builder.max_size
+            };
+            let sent = self.populate_packet(now, space_id, buf, max_size, builder.exact_number);
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -3203,11 +3232,16 @@ impl Connection {
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
-        let initial_frame_layout = if space_id == SpaceId::Initial && self.side.is_client() {
-            self.config.initial_frame_layout.clone()
-        } else {
-            None
-        };
+        let initial_packet_chaos = space_id == SpaceId::Initial
+            && self.side.is_client()
+            && self.config.initial_packet_chaos;
+        let packet_payload_start = buf.len();
+        let initial_frame_layout =
+            if space_id == SpaceId::Initial && self.side.is_client() && !initial_packet_chaos {
+                self.config.initial_frame_layout.clone()
+            } else {
+                None
+            };
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3309,15 +3343,27 @@ impl Connection {
             }
         }
 
-        let initial_layout_applied = Self::populate_initial_frame_layout_packet(
-            initial_frame_layout.as_ref(),
-            space,
-            buf,
-            max_size,
-            pn,
-            &mut sent,
-            &mut self.stats,
-        );
+        let initial_layout_applied = if initial_packet_chaos {
+            initial_chaos::populate_packet(
+                &mut space.pending.crypto,
+                buf,
+                max_size,
+                packet_payload_start,
+                &mut self.rng,
+                &mut sent,
+                &mut self.stats,
+            )
+        } else {
+            Self::populate_initial_frame_layout_packet(
+                initial_frame_layout.as_ref(),
+                space,
+                buf,
+                max_size,
+                pn,
+                &mut sent,
+                &mut self.stats,
+            )
+        };
 
         // CRYPTO
         while !initial_layout_applied

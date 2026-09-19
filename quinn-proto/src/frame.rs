@@ -548,6 +548,10 @@ pub(crate) struct Iter {
 }
 
 impl Iter {
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
     pub(crate) fn new(payload: Bytes) -> Result<Self, TransportError> {
         if payload.is_empty() {
             // "An endpoint MUST treat receipt of a packet containing no frames as a

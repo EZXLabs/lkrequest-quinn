@@ -46,6 +46,7 @@ pub struct TransportConfig {
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
     pub(crate) enable_ecn: bool,
     pub(crate) initial_frame_layout: Option<InitialFrameLayoutConfig>,
+    pub(crate) initial_packet_chaos: bool,
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
@@ -367,6 +368,20 @@ impl TransportConfig {
         self
     }
 
+    /// Apply Chromium's dynamic CRYPTO fragmentation and PING/PADDING shuffling
+    /// to client Initial packets.
+    ///
+    /// Disabled by default. Packet sizes follow [`Self::initial_datagram_size`]
+    /// and the available path MTU. Fragmentation uses the actual pending handshake
+    /// bytes, including after Retry and on retransmission. This takes precedence
+    /// over [`Self::initial_frame_layout`] and does not affect other packet spaces.
+    /// If a Retry token leaves too little payload space at the configured target
+    /// size, packets may grow to the path MTU to make progress.
+    pub fn initial_packet_chaos(&mut self, enabled: bool) -> &mut Self {
+        self.initial_packet_chaos = enabled;
+        self
+    }
+
     /// Extra QUIC transport parameters to advertise during the TLS handshake.
     ///
     /// This is intended for fingerprint/profile compatibility experiments such
@@ -476,6 +491,7 @@ impl Default for TransportConfig {
             ack_frequency_config: None,
             enable_ecn: true,
             initial_frame_layout: None,
+            initial_packet_chaos: false,
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
@@ -520,6 +536,7 @@ impl fmt::Debug for TransportConfig {
             ack_frequency_config,
             enable_ecn,
             initial_frame_layout,
+            initial_packet_chaos,
             persistent_congestion_threshold,
             keep_alive_interval,
             crypto_buffer_size,
@@ -556,6 +573,7 @@ impl fmt::Debug for TransportConfig {
             .field("ack_frequency_config", ack_frequency_config)
             .field("enable_ecn", enable_ecn)
             .field("initial_frame_layout", initial_frame_layout)
+            .field("initial_packet_chaos", initial_packet_chaos)
             .field(
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,
