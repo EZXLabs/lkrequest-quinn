@@ -478,6 +478,7 @@ impl TransportParameters {
                 return Err(Error::Malformed);
             }
             let len = len as usize;
+            let remaining_before = r.remaining();
 
             match id {
                 0x00 => decode_cid(len, &mut params.original_dst_cid, r)?,
@@ -530,6 +531,10 @@ impl TransportParameters {
                     }
                     apply_params!(parse);
                 }
+            }
+
+            if remaining_before - r.remaining() != len {
+                return Err(Error::Malformed);
             }
         }
 
@@ -775,6 +780,59 @@ mod test {
                 Err(Error::IllegalValue)
             );
         }
+    }
+
+    #[test]
+    fn read_length_mismatch() {
+        // The extra value bytes must not be decoded as disable_active_migration.
+        let mut buf = Vec::new();
+        buf.write_var(0x20);
+        buf.write_var(3);
+        buf.write(VarInt::from_u32(0));
+        buf.write_var(0x0c);
+        buf.write_var(0);
+        assert_eq!(
+            TransportParameters::read(Side::Server, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn read_min_ack_delay_length_mismatch() {
+        // A zero-length min_ack_delay must not consume the following parameter.
+        let mut buf = Vec::new();
+        buf.write_var(0xff04de1a);
+        buf.write_var(0);
+        buf.write_var(0x04);
+        buf.write_var(1);
+        buf.write(VarInt::from_u32(7));
+        assert_eq!(
+            TransportParameters::read(Side::Server, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn read_preferred_address_length_mismatch() {
+        // Reject trailing bytes beyond the preferred address's encoded size.
+        let address = PreferredAddress {
+            address_v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42)),
+            address_v6: None,
+            connection_id: ConnectionId::new(&[0x42]),
+            stateless_reset_token: [0xab; RESET_TOKEN_SIZE].into(),
+        };
+        let mut value = Vec::new();
+        address.write(&mut value);
+        value.write_var(0x0c);
+        value.write_var(0);
+        let mut buf = Vec::new();
+        buf.write_var(0x0d);
+        buf.write_var(value.len() as u64);
+        buf.extend_from_slice(&value);
+        assert_eq!(
+            TransportParameters::read(Side::Client, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
     }
 
     #[test]

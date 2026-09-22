@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
-use rand::RngCore;
+use rand::Rng;
 
 use super::{ConnectionStats, SentFrames};
 use crate::{Frame, VarInt, coding::BufMutExt, frame};
@@ -26,7 +26,7 @@ pub(super) fn populate_packet(
     buf: &mut Vec<u8>,
     max_size: usize,
     packet_payload_start: usize,
-    rng: &mut impl RngCore,
+    rng: &mut impl Rng,
     sent: &mut SentFrames,
     stats: &mut ConnectionStats,
 ) -> bool {
@@ -111,7 +111,7 @@ fn take_crypto(
     pending: &mut VecDeque<frame::Crypto>,
     budget: usize,
     packet_payload_size: usize,
-    rng: &mut impl RngCore,
+    rng: &mut impl Rng,
 ) -> Vec<Element> {
     let Some(first) = pending.front() else {
         return Vec::new();
@@ -182,7 +182,7 @@ fn take_crypto(
     frames
 }
 
-fn protect(frames: &mut Vec<Element>, mut padding: usize, rng: &mut impl RngCore) {
+fn protect(frames: &mut Vec<Element>, mut padding: usize, rng: &mut impl Rng) {
     let (start, end) = frames.iter().fold((u64::MAX, 0), |(start, end), frame| {
         let Element::Crypto(crypto) = frame else {
             return (start, end);
@@ -418,15 +418,18 @@ mod tests {
     #[test]
     fn initial_chaos_matches_chromium_zero_random_sequence() {
         struct ZeroRandom;
-        impl RngCore for ZeroRandom {
-            fn next_u32(&mut self) -> u32 {
-                0
+        impl rand::TryRng for ZeroRandom {
+            type Error = std::convert::Infallible;
+
+            fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+                Ok(0)
             }
-            fn next_u64(&mut self) -> u64 {
-                0
+            fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+                Ok(0)
             }
-            fn fill_bytes(&mut self, bytes: &mut [u8]) {
+            fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
                 bytes.fill(0);
+                Ok(())
             }
         }
         let mut frames = vec![Element::Crypto(frame::Crypto {
