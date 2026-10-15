@@ -35,8 +35,18 @@ use crate::{
 mod util;
 use util::*;
 
+mod ack_cancel;
+mod blocked_close;
 mod initial_chaos;
+mod pto_alarm;
+mod pto_clock;
+mod pto_fingerprint;
+mod pto_timing;
+mod pto_write_queue;
+mod stop_after_fin;
+mod terminal_packetization;
 mod token;
+mod zero_rtt_reuse;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;

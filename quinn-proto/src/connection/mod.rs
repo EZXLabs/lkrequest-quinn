@@ -96,6 +96,27 @@ mod timer;
 use crate::congestion::Controller;
 use timer::{Timer, TimerTable};
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct PtoTimingSnapshot {
+    pub(crate) smoothed: Duration,
+    pub(crate) variance: Duration,
+    pub(crate) sampled: bool,
+    pub(crate) max_ack_delay: Duration,
+    pub(crate) backoff: u32,
+    pub(crate) first_in_flight: Option<Instant>,
+    pub(crate) last_in_flight: Option<Instant>,
+    pub(crate) last_ack_eliciting: Option<Instant>,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) handshaking: bool,
+    pub(crate) has_data_keys: bool,
+    pub(crate) has_handshake_keys: bool,
+    pub(crate) data_acknowledged: bool,
+    pub(crate) handshake_in_flight: bool,
+    pub(crate) confirmed: bool,
+    pub(crate) first_1rtt_boundary: Option<u64>,
+}
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -159,6 +180,7 @@ pub struct Connection {
     side: ConnectionSide,
     /// Whether or not 0-RTT was enabled during the handshake. Does not imply acceptance.
     zero_rtt_enabled: bool,
+    first_1rtt_packet_number: Option<u64>,
     /// Set if 0-RTT is supported, then cleared when no longer needed.
     zero_rtt_crypto: Option<ZeroRttCrypto>,
     key_phase: bool,
@@ -192,6 +214,7 @@ pub struct Connection {
     next_crypto: Option<KeyPair<Box<dyn PacketKey>>>,
     accepted_0rtt: bool,
     rejected_0rtt: bool,
+    rejected_0rtt_streams_reused: bool,
     /// Whether the idle timer should be reset the next time an ack-eliciting packet is transmitted.
     permit_idle_reset: bool,
     /// Negotiated idle timeout
@@ -217,6 +240,8 @@ pub struct Connection {
     /// Responses to PATH_CHALLENGE frames
     path_responses: PathResponses,
     close: bool,
+    discard_blocked_close_eligible: bool,
+    close_suppressed: bool,
 
     //
     // ACK frequency
@@ -303,6 +328,7 @@ impl Connection {
             state,
             side: connection_side,
             zero_rtt_enabled: false,
+            first_1rtt_packet_number: None,
             zero_rtt_crypto: None,
             key_phase: false,
             // A small initial key phase size ensures peers that don't handle key updates correctly
@@ -326,6 +352,7 @@ impl Connection {
             next_crypto: None,
             accepted_0rtt: false,
             rejected_0rtt: false,
+            rejected_0rtt_streams_reused: false,
             permit_idle_reset: true,
             idle_timeout: match config.max_idle_timeout {
                 None | Some(VarInt(0)) => None,
@@ -344,6 +371,8 @@ impl Connection {
 
             path_responses: PathResponses::default(),
             close: false,
+            discard_blocked_close_eligible: false,
+            close_suppressed: false,
 
             ack_frequency: AckFrequencyState::new(get_max_ack_delay(
                 &TransportParameters::default(),
@@ -488,13 +517,14 @@ impl Connection {
 
         // If we need to send a probe, make sure we have something to send.
         for space in SpaceId::iter() {
-            let request_immediate_ack =
-                space == SpaceId::Data && self.peer_supports_ack_frequency();
+            let request_immediate_ack = space == SpaceId::Data
+                && self.peer_supports_ack_frequency()
+                && !self.single_probe_with_gap(space);
             self.spaces[space].maybe_queue_probe(request_immediate_ack, &self.streams);
         }
 
         // Check whether we need to send a close message
-        let close = match self.state {
+        let mut close = match self.state {
             State::Drained => {
                 self.app_limited = true;
                 return None;
@@ -502,7 +532,7 @@ impl Connection {
             State::Draining | State::Closed(_) => {
                 // self.close is only reset once the associated packet had been
                 // encoded successfully
-                if !self.close {
+                if !self.close || self.close_suppressed {
                     self.app_limited = true;
                     return None;
                 }
@@ -815,6 +845,8 @@ impl Connection {
                 ack_eliciting,
                 self,
             )?);
+            // The builder can consume the final key use by closing the connection.
+            close |= self.state.is_closed();
             coalesce = coalesce && !builder.short_header;
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
@@ -1068,6 +1100,120 @@ impl Connection {
                 1 => None,
                 _ => Some(segment_size),
             },
+            src_ip: self.local_ip,
+        })
+    }
+
+    /// Whether a blocked writer may commit a confirmed 1-RTT PTO packet.
+    ///
+    /// This does not grant permission to drain ordinary application writes.
+    pub fn can_queue_pto_while_blocked(&self) -> bool {
+        self.config.queue_pto_while_blocked
+            && self.side.is_client()
+            && self.state.is_established()
+            && self.handshake_confirmed()
+            && self.spaces[SpaceId::Data].crypto.is_some()
+            && self.spaces[SpaceId::Data].loss_probes != 0
+    }
+
+    /// Commit one PTO datagram behind a blocked lower writer.
+    ///
+    /// Selects outstanding frames only. The returned ciphertext has already
+    /// entered sent-packet accounting and must not be committed again on retry.
+    pub fn poll_blocked_pto_transmit(
+        &mut self,
+        now: Instant,
+        buf: &mut Vec<u8>,
+    ) -> Option<Transmit> {
+        if !self.can_queue_pto_while_blocked() {
+            return None;
+        }
+        debug_assert!(buf.is_empty());
+        let candidate = self.spaces[SpaceId::Data]
+            .sent_packets
+            .values()
+            .find_map(|packet| {
+                if !packet.ack_eliciting {
+                    return None;
+                }
+                let mut controls = packet.retransmits.get().cloned().unwrap_or_default();
+                controls
+                    .reset_stream
+                    .retain(|(id, _)| self.streams.reset_is_outstanding(*id));
+                let frames = self.streams.outstanding_probe_frames(&packet.stream_frames);
+                (!controls.is_empty(&self.streams) || !frames.is_empty())
+                    .then_some((controls, frames))
+            });
+        // Like the blocked QUICHE path, do not substitute fresh application
+        // writes for a missing retransmission candidate.
+        let fallback_ping = candidate.is_none();
+        if fallback_ping
+            && (self.streams.can_send_stream_data()
+                || !self.spaces[SpaceId::Data].pending.is_empty(&self.streams)
+                || !self.datagrams.outgoing.is_empty())
+        {
+            return None;
+        }
+        let (controls, frames) = candidate.unwrap_or_default();
+        let size = usize::from(self.path.current_mtu().min(INITIAL_MTU));
+        if self.path.anti_amplification_blocked(size as u64) {
+            return None;
+        }
+        buf.reserve(size);
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            self.rem_cids.active(),
+            buf,
+            size,
+            0,
+            true,
+            self,
+        )?;
+        let space = &mut self.spaces[SpaceId::Data];
+        let pending = mem::replace(&mut space.pending, controls);
+        let ping = mem::replace(&mut space.ping_pending, fallback_ping);
+        let immediate_ack = mem::replace(&mut space.immediate_ack_pending, false);
+        let sent = self.populate_packet_with_probe(
+            now,
+            SpaceId::Data,
+            buf,
+            builder.max_size,
+            builder.exact_number,
+            Some(&frames),
+        );
+        let space = &mut self.spaces[SpaceId::Data];
+        space.pending = pending;
+        space.ping_pending |= ping;
+        space.immediate_ack_pending |= immediate_ack;
+        space.loss_probes -= 1;
+        if sent.largest_acked.is_some() {
+            space.pending_acks.acks_sent();
+            self.timers.stop(Timer::MaxAckDelay);
+            self.next_bundled_ack_time = Some(now + self.next_bundled_ack_delay());
+        }
+        if sent.requires_padding
+            || (self.config.pad_to_mtu && size == usize::from(self.path.current_mtu()))
+        {
+            builder.pad_to(size as u16);
+        }
+        let number = builder.exact_number;
+        builder.finish_and_track(now, self, Some(sent), buf);
+        self.path.congestion.on_sent(now, buf.len() as u64, number);
+        self.config.qlog_sink.emit_recovery_metrics(
+            self.pto_count,
+            &mut self.path,
+            now,
+            self.orig_rem_cid,
+        );
+        self.app_limited = false;
+        self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
+        self.stats.udp_tx.on_sent(1, buf.len());
+        Some(Transmit {
+            destination: self.path.remote,
+            size: buf.len(),
+            ecn: self.path.sending_ecn.then_some(EcnCodepoint::Ect0),
+            segment_size: None,
             src_ip: self.local_ip,
         })
     }
@@ -1326,14 +1472,44 @@ impl Connection {
         )
     }
 
+    /// Terminate immediately when the transport can no longer drive this connection.
+    ///
+    /// No close packet is sent. Application and endpoint events remain available
+    /// through their respective polling methods. Repeated calls after draining
+    /// do not generate another endpoint cleanup event.
+    pub fn abort(&mut self, reason: ConnectionError) {
+        if !self.is_drained() {
+            self.kill(reason);
+        }
+    }
+
     fn close_inner(&mut self, now: Instant, reason: Close) {
         let was_closed = self.state.is_closed();
         if !was_closed {
+            self.discard_blocked_close_eligible = self.config.discard_blocked_close
+                && self.side.is_client()
+                && matches!(self.state, State::Established)
+                && self.handshake_confirmed()
+                && self.spaces[SpaceId::Data].crypto.is_some()
+                && matches!(reason, Close::Application(_));
             self.close_common();
             self.set_close_timer(now);
             self.close = true;
             self.state = State::Closed(state::Closed { reason });
         }
+    }
+
+    /// Permanently suppress a close that the runtime cannot write.
+    ///
+    /// Only an explicitly configured, confirmed client application close qualifies.
+    /// The close timer and terminal notifications retain their normal lifecycle.
+    pub fn discard_blocked_close(&mut self) -> bool {
+        if !self.discard_blocked_close_eligible || !matches!(self.state, State::Closed(_)) {
+            return false;
+        }
+        self.close_suppressed = true;
+        self.close = false;
+        true
     }
 
     /// Control datagrams
@@ -1407,6 +1583,13 @@ impl Connection {
         self.state.is_closed()
     }
 
+    /// Whether the connection is in the draining phase.
+    ///
+    /// This is distinct from locally closing and from the final drained state.
+    pub fn is_draining(&self) -> bool {
+        matches!(self.state, State::Draining)
+    }
+
     /// Whether there is no longer any need to keep the connection around
     ///
     /// Closed connections become drained after a brief timeout to absorb any remaining in-flight
@@ -1420,6 +1603,14 @@ impl Connection {
     /// The value is meaningless until after the handshake completes.
     pub fn accepted_0rtt(&self) -> bool {
         self.accepted_0rtt
+    }
+
+    /// Whether a completed handshake preserved a compatibly rejected early stream epoch.
+    ///
+    /// This historical result remains true after a later connection failure. It is distinct from
+    /// TLS acceptance: [`Self::accepted_0rtt`] is still false when rejected streams are reused.
+    pub fn rejected_0rtt_streams_reused(&self) -> bool {
+        self.rejected_0rtt_streams_reused
     }
 
     /// Whether 0-RTT is/was possible during the handshake
@@ -1527,6 +1718,31 @@ impl Connection {
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
+        if space == SpaceId::Data
+            && self.rejected_0rtt_streams_reused
+            && self
+                .first_1rtt_packet_number
+                .is_some_and(|first| ack.iter().any(|range| *range.start() < first))
+        {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "rejected 0-RTT packet acked",
+            ));
+        }
+        if self.single_probe_with_gap(space)
+            && self.spaces[space]
+                .largest_sent_packet
+                .is_none_or(|sent| ack.largest > sent)
+        {
+            return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
+        }
+        // Validate every live deliberate gap before ACK callbacks can release
+        // packets and advance the retention floor.
+        if space == SpaceId::Data {
+            let floor = self.pto_gap_floor();
+            for range in ack.iter() {
+                self.packet_number_filter.check_pto_ack(range, floor)?;
+            }
+        }
         let new_largest = {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
@@ -1552,7 +1768,20 @@ impl Connection {
             }
         }
 
+        // A validated 1-RTT ACK confirms the client's handshake, even when its
+        // packet record was already retired. Invalid ranges must not drop keys.
+        if space == SpaceId::Data
+            && self.side.is_client()
+            && self.spaces[SpaceId::Handshake].crypto.is_some()
+            && self.handshake_confirmed()
+        {
+            self.discard_space(now, SpaceId::Handshake);
+        }
+
         if newly_acked.is_empty() {
+            if space == SpaceId::Data {
+                self.retire_pto_skips();
+            }
             return Ok(());
         }
 
@@ -1682,6 +1911,35 @@ impl Connection {
 
         // Update state for confirmed delivery of frames
         if let Some(retransmits) = info.retransmits.get() {
+            if self.config.queue_pto_while_blocked && !retransmits.stop_sending.is_empty() {
+                // A blocked-writer probe copies control metadata. An ACK of
+                // either copy retires the control identity, but does not revoke
+                // ciphertext already committed to the runtime's FIFO.
+                let acknowledged = |stop: &frame::StopSending| {
+                    retransmits
+                        .stop_sending
+                        .iter()
+                        .any(|acked| stop.id == acked.id && stop.error_code == acked.error_code)
+                };
+                let space = &mut self.spaces[SpaceId::Data];
+                space
+                    .pending
+                    .stop_sending
+                    .retain(|stop| !acknowledged(stop));
+                for packet in space.sent_packets.values_mut() {
+                    if packet
+                        .retransmits
+                        .get()
+                        .is_some_and(|pending| !pending.stop_sending.is_empty())
+                    {
+                        packet
+                            .retransmits
+                            .get_or_create()
+                            .stop_sending
+                            .retain(|stop| !acknowledged(stop));
+                    }
+                }
+            }
             for (id, _) in retransmits.reset_stream.iter() {
                 self.streams.reset_acked(*id);
             }
@@ -1730,6 +1988,17 @@ impl Connection {
             "PTO fired"
         );
 
+        let single_probe = self.single_probe_with_gap(space);
+        if single_probe {
+            self.retire_pto_skips();
+            if let Err(error) = self
+                .packet_number_filter
+                .skip_for_pto(&mut self.rng, &mut self.spaces[space])
+            {
+                self.kill(error.into());
+                return;
+            }
+        }
         let count = match self.path.in_flight.ack_eliciting {
             // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
             // deadlock preventions
@@ -1738,19 +2007,75 @@ impl Connection {
                 1
             }
             // Conventional loss probe
-            _ => 2,
+            _ => {
+                if single_probe {
+                    1
+                } else {
+                    2
+                }
+            }
         };
-        self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
+        self.spaces[space].loss_probes = if single_probe {
+            1
+        } else {
+            self.spaces[space].loss_probes.saturating_add(count)
+        };
         self.pto_count = self.pto_count.saturating_add(1);
         self.set_loss_detection_timer(now);
+    }
+
+    fn single_probe_with_gap(&self, space: SpaceId) -> bool {
+        self.config.pto_single_probe_with_gap
+            && space == SpaceId::Data
+            && self.spaces[space].crypto.is_some()
+    }
+
+    fn pto_gap_floor(&self) -> u64 {
+        let space = &self.spaces[SpaceId::Data];
+        space
+            .sent_packets
+            .first_key_value()
+            .map_or(space.next_packet_number, |(&pn, _)| pn)
+    }
+
+    fn retire_pto_skips(&mut self) {
+        self.packet_number_filter
+            .retire_pto_skips(self.pto_gap_floor());
     }
 
     fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
         let mut lost_packets = Vec::<u64>::new();
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
-        let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        let loss_delay = if self.config.chrome_loss_timing {
+            let rtt = self.path.rtt.chrome_loss_rtt();
+            let shift = if self.config.time_threshold == 1.25 {
+                Some(2)
+            } else if self.config.time_threshold == 1.125 {
+                Some(3)
+            } else {
+                None
+            };
+            if let Some(shift) = shift {
+                let micros = rtt.as_micros();
+                let delay = micros + (micros >> shift);
+                if delay <= i64::MAX as u128 {
+                    Duration::from_micros(delay as u64)
+                } else {
+                    rtt.mul_f32(self.config.time_threshold)
+                }
+            } else {
+                rtt.mul_f32(self.config.time_threshold)
+            }
+        } else {
+            cmp::max(
+                self.path
+                    .rtt
+                    .conservative()
+                    .mul_f32(self.config.time_threshold),
+                TIMER_GRANULARITY,
+            )
+        };
 
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
@@ -1876,6 +2201,9 @@ impl Connection {
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
         }
+        if pn_space == SpaceId::Data {
+            self.retire_pto_skips();
+        }
     }
 
     fn loss_time_and_space(&self) -> Option<(Instant, SpaceId)> {
@@ -1890,10 +2218,7 @@ impl Connection {
 
         if self.path.in_flight.ack_eliciting == 0 {
             debug_assert!(!self.peer_completed_address_validation());
-            let space = match self.highest_space {
-                SpaceId::Handshake => SpaceId::Handshake,
-                _ => SpaceId::Initial,
-            };
+            let space = self.anti_deadlock_pto_space()?;
             return Some((now + duration, space));
         }
 
@@ -1903,9 +2228,15 @@ impl Connection {
                 continue;
             }
             if space == SpaceId::Data {
-                // Skip ApplicationData until handshake completes.
-                if self.is_handshaking() {
-                    return result;
+                // Application PTO requires confirmation, not just TLS completion.
+                if !self.handshake_confirmed() {
+                    continue;
+                }
+                if let Some(pto) = self.chrome_data_pto_time(now, backoff) {
+                    if result.is_none_or(|(earliest_pto, _)| pto < earliest_pto) {
+                        result = Some((pto, space));
+                    }
+                    continue;
                 }
                 // Include max_ack_delay and backoff for ApplicationData.
                 duration += self.ack_frequency.max_ack_delay_for_pto() * backoff;
@@ -1919,7 +2250,59 @@ impl Connection {
                 result = Some((pto, space));
             }
         }
+        if result.is_none() && !self.peer_completed_address_validation() {
+            return Some((now + duration, self.anti_deadlock_pto_space()?));
+        }
         result
+    }
+
+    fn anti_deadlock_pto_space(&self) -> Option<SpaceId> {
+        [SpaceId::Handshake, SpaceId::Initial]
+            .into_iter()
+            .find(|&space| self.spaces[space].crypto.is_some())
+    }
+
+    fn handshake_confirmed(&self) -> bool {
+        !self.is_handshaking()
+            && (self.side.is_server()
+                || self.spaces[SpaceId::Handshake].crypto.is_none()
+                || self
+                    .first_1rtt_packet_number
+                    .zip(self.spaces[SpaceId::Data].largest_acked_packet)
+                    .is_some_and(|(first, acked)| acked >= first))
+    }
+
+    fn chrome_data_pto_time(&self, now: Instant, backoff: u32) -> Option<Instant> {
+        let space = &self.spaces[SpaceId::Data];
+        if !self.config.chrome_pto_timing || space.crypto.is_none() || !self.handshake_confirmed() {
+            return None;
+        }
+        let whole_micros =
+            |value: Duration| Duration::new(value.as_secs(), value.subsec_micros() * 1_000);
+        let (srtt, variance) = self.path.rtt.sampled_rtt_inputs()?;
+        let srtt = whole_micros(srtt);
+        let variance = whole_micros(variance);
+        let ack_delay = whole_micros(self.ack_frequency.max_ack_delay_for_pto());
+        let base = srtt
+            .checked_add(variance.checked_mul(2)?.max(TIMER_GRANULARITY))?
+            .checked_add(ack_delay)?;
+        // Padded ACK-only packets count toward native congestion, but do not
+        // establish an ack-eliciting flight. PN order chooses the first packet.
+        let first = space
+            .sent_packets
+            .values()
+            .find(|packet| packet.ack_eliciting)?
+            .time_sent;
+        let last = space.time_of_last_ack_eliciting_packet?;
+        if self.pto_count == 0 {
+            let half = whole_micros((srtt / 2).checked_add(Duration::from_nanos(500))?);
+            Some(
+                now.max(first.checked_add(base)?)
+                    .max(last.checked_add(srtt.checked_add(half)?)?),
+            )
+        } else {
+            Some(now.max(last.checked_add(base.checked_mul(backoff)?)?))
+        }
     }
 
     fn peer_completed_address_validation(&self) -> bool {
@@ -1944,9 +2327,22 @@ impl Connection {
             return;
         }
 
-        if let Some((loss_time, _)) = self.loss_time_and_space() {
+        // An unpacketized 1-RTT probe already has permission to send. Its
+        // transmission will consume that credit and rearm loss detection.
+        if self.single_probe_with_gap(SpaceId::Data) && self.spaces[SpaceId::Data].loss_probes != 0
+        {
+            self.timers.stop(Timer::LossDetection);
+            return;
+        }
+
+        if let Some((loss_time, space)) = self.loss_time_and_space() {
             // Time threshold loss detection.
-            self.timers.set(Timer::LossDetection, loss_time);
+            let chrome_granularity = space == SpaceId::Data
+                && self.config.chrome_pto_timing
+                && self.spaces[SpaceId::Data].crypto.is_some()
+                && self.handshake_confirmed()
+                && self.path.rtt.sampled_rtt_inputs().is_some();
+            self.set_recovery_alarm(loss_time, chrome_granularity);
             return;
         }
 
@@ -1965,11 +2361,27 @@ impl Connection {
 
         // Determine which PN space to arm PTO for.
         // Calculate PTO duration
-        if let Some((timeout, _)) = self.pto_time_and_space(now) {
-            self.timers.set(Timer::LossDetection, timeout);
+        if let Some((timeout, space)) = self.pto_time_and_space(now) {
+            let backoff = 2u32.pow(self.pto_count.min(MAX_BACKOFF_EXPONENT));
+            let chrome_granularity =
+                space == SpaceId::Data && self.chrome_data_pto_time(now, backoff) == Some(timeout);
+            self.set_recovery_alarm(timeout, chrome_granularity);
         } else {
             self.timers.stop(Timer::LossDetection);
         }
+    }
+
+    fn set_recovery_alarm(&mut self, deadline: Instant, chrome_granularity: bool) {
+        // PTO and time-threshold loss share the same logical alarm in Chrome.
+        if chrome_granularity
+            && self
+                .timers
+                .get(Timer::LossDetection)
+                .is_some_and(|old| old.max(deadline) - old.min(deadline) < TIMER_GRANULARITY)
+        {
+            return;
+        }
+        self.timers.set(Timer::LossDetection, deadline);
     }
 
     /// Probe Timeout
@@ -2204,7 +2616,7 @@ impl Connection {
             }
         }
         if reject_0rtt {
-            self.reject_0rtt();
+            self.reject_0rtt(None);
         }
 
         Ok(())
@@ -2257,6 +2669,7 @@ impl Connection {
         );
         trace!("{:?} keys ready", space);
         if space == SpaceId::Data {
+            self.first_1rtt_packet_number = Some(self.spaces[space].next_packet_number);
             // Precompute the first key update
             self.next_crypto = Some(
                 self.crypto
@@ -2488,7 +2901,7 @@ impl Connection {
 
         // Transmit CONNECTION_CLOSE if necessary
         if let State::Closed(_) = self.state {
-            self.close = remote == self.path.remote;
+            self.close = !self.close_suppressed && remote == self.path.remote;
         }
     }
 
@@ -2646,9 +3059,10 @@ impl Connection {
                                 reason: "transport parameters missing".into(),
                             })?;
 
+                    let mut reused_0rtt_streams = false;
                     if self.has_0rtt() {
                         if !self.crypto.early_data_accepted().unwrap() {
-                            self.reject_0rtt();
+                            reused_0rtt_streams = self.reject_0rtt(Some(&params));
                         } else {
                             self.accepted_0rtt = true;
                             params.validate_resumption_from(&self.peer_params)?;
@@ -2659,6 +3073,10 @@ impl Connection {
                             .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
                     }
                     self.handle_peer_params(params)?;
+                    if reused_0rtt_streams {
+                        self.streams.update_reused_0rtt_send_limits();
+                        self.rejected_0rtt_streams_reused = true;
+                    }
                     self.issue_first_cids(now);
                 } else {
                     // Server-only
@@ -2741,23 +3159,37 @@ impl Connection {
         }
     }
 
-    fn reject_0rtt(&mut self) {
+    fn reject_0rtt(&mut self, params: Option<&TransportParameters>) -> bool {
         if self.rejected_0rtt {
-            return;
+            return false;
         }
 
         debug_assert!(self.side.is_client());
         debug!("0-RTT rejected");
         self.rejected_0rtt = true;
         self.accepted_0rtt = false;
-        self.streams.zero_rtt_rejected();
-
-        self.spaces[SpaceId::Data].pending = Retransmits::default();
+        let reuse = self.config.reuse_rejected_0rtt_streams
+            && !self.crypto.is_handshaking()
+            && self.spaces[SpaceId::Data].crypto.is_some()
+            && self.crypto.early_data_rejection_allows_stream_reuse()
+            && params
+                .is_some_and(|params| params.validate_resumption_from(&self.peer_params).is_ok());
+        if !reuse {
+            self.streams.zero_rtt_rejected();
+            self.spaces[SpaceId::Data].pending = Retransmits::default();
+        }
 
         let sent_packets = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
         for packet in sent_packets.into_values() {
             self.remove_in_flight(&packet);
+            if reuse {
+                self.spaces[SpaceId::Data].pending |= packet.retransmits;
+                for frame in packet.stream_frames {
+                    self.streams.retransmit(frame);
+                }
+            }
         }
+        reuse
     }
 
     /// Process an Initial or Handshake packet payload
@@ -2969,7 +3401,15 @@ impl Connection {
                             "STOP_SENDING on unopened stream",
                         ));
                     }
+                    let reset_finished = self.config.reset_finished_on_stop
+                        && !packet.header.is_0rtt()
+                        && self.streams.is_finished_unstopped(id);
                     self.streams.received_stop_sending(id, error_code);
+                    if reset_finished {
+                        // Queue RESET before a later ACK in this packet can
+                        // release the finished stream, reusing reset bookkeeping.
+                        let _ = self.send_stream(id).reset(error_code);
+                    }
                 }
                 Frame::RetireConnectionId { sequence } => {
                     let allow_more_cids = self
@@ -3231,6 +3671,18 @@ impl Connection {
         max_size: usize,
         pn: u64,
     ) -> SentFrames {
+        self.populate_packet_with_probe(now, space_id, buf, max_size, pn, None)
+    }
+
+    fn populate_packet_with_probe(
+        &mut self,
+        now: Instant,
+        space_id: SpaceId,
+        buf: &mut Vec<u8>,
+        max_size: usize,
+        pn: u64,
+        probe_frames: Option<&[frame::StreamMeta]>,
+    ) -> SentFrames {
         let mut sent = SentFrames::default();
         let initial_packet_chaos = space_id == SpaceId::Initial
             && self.side.is_client()
@@ -3244,7 +3696,12 @@ impl Connection {
             };
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
-        space.pending_acks.maybe_ack_non_eliciting();
+        let ack_obligation_only = (self.config.ack_obligation_only || probe_frames.is_some())
+            && space_id == SpaceId::Data
+            && !is_0rtt;
+        if !ack_obligation_only {
+            space.pending_acks.maybe_ack_non_eliciting();
+        }
 
         let pre_payload_len = buf.len();
 
@@ -3275,6 +3732,15 @@ impl Connection {
 
         // ACK
         if space.pending_acks.can_send() {
+            // A blocked-writer probe must still carry its selected eliciting
+            // frame when a large ACK would otherwise fill the datagram.
+            let ack_max_size = if probe_frames.is_some() {
+                max_size.saturating_sub(
+                    frame::NewConnectionId::SIZE_BOUND.max(frame::Stream::SIZE_BOUND + 1),
+                )
+            } else {
+                max_size
+            };
             Self::try_populate_acks(
                 now,
                 self.receiving_ecn,
@@ -3282,7 +3748,7 @@ impl Connection {
                 space,
                 buf,
                 &mut self.stats,
-                max_size,
+                ack_max_size,
             );
         }
 
@@ -3317,7 +3783,7 @@ impl Connection {
         }
 
         // PATH_CHALLENGE
-        if buf.len() + 9 < max_size && space_id == SpaceId::Data {
+        if buf.len() + 9 < max_size && space_id == SpaceId::Data && probe_frames.is_none() {
             // Transmit challenges with every outgoing frame on an unvalidated path
             if let Some(token) = self.path.challenge {
                 // But only send a packet solely for that purpose at most once
@@ -3332,7 +3798,7 @@ impl Connection {
         }
 
         // PATH_RESPONSE
-        if buf.len() + 9 < max_size && space_id == SpaceId::Data {
+        if buf.len() + 9 < max_size && space_id == SpaceId::Data && probe_frames.is_none() {
             if let Some(token) = self.path_responses.pop_on_path(self.path.remote) {
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
@@ -3417,6 +3883,7 @@ impl Connection {
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
+                self.config.stop_before_matching_reset && !is_0rtt,
             );
         }
 
@@ -3457,7 +3924,10 @@ impl Connection {
 
         // DATAGRAM
         let mut sent_datagrams = false;
-        while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
+        while buf.len() + Datagram::SIZE_BOUND < max_size
+            && space_id == SpaceId::Data
+            && probe_frames.is_none()
+        {
             match self.datagrams.write(buf, max_size) {
                 true => {
                     sent_datagrams = true;
@@ -3513,9 +3983,14 @@ impl Connection {
 
         // STREAM
         if space_id == SpaceId::Data {
-            sent.stream_frames =
-                self.streams
-                    .write_stream_frames(buf, max_size, self.config.send_fairness);
+            sent.stream_frames = match probe_frames {
+                Some(frames) => self
+                    .streams
+                    .write_probe_stream_frames(frames, buf, max_size),
+                None => self
+                    .streams
+                    .write_stream_frames(buf, max_size, self.config.send_fairness),
+            };
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
         }
 
@@ -3523,11 +3998,14 @@ impl Connection {
         // We want to reuse encryption and underlying protocol overhead,
         // but sending multiple ACKs for a single incoming packet is a waste of peer's resources,
         // so we have next_bundled_ack_time to control when to send ACKs.
+        // The obligation-only policy instead bundles when a new ACK is due.
         let any_frames_sent = buf.len() > pre_payload_len;
         if any_frames_sent
             && sent.largest_acked.is_none()
-            && self.next_bundled_ack_time.is_some_and(|time| time <= now)
-            && space.pending_acks.can_send_with_other_frames()
+            && (ack_obligation_only || self.next_bundled_ack_time.is_some_and(|time| time <= now))
+            && space
+                .pending_acks
+                .can_send_with_other_frames(ack_obligation_only)
         {
             Self::try_populate_acks(
                 now,
@@ -3906,9 +4384,176 @@ impl Connection {
         self.spaces[self.highest_space].immediate_ack_pending = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_packetization_state_for_test(&self, space: SpaceId) -> (u64, u64, u64) {
+        assert_ne!(space, SpaceId::Data);
+        let space = &self.spaces[space];
+        (
+            space
+                .crypto
+                .as_ref()
+                .unwrap()
+                .packet
+                .local
+                .confidentiality_limit(),
+            space.sent_with_keys,
+            space.next_packet_number,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_terminal_packetization_count_for_test(&mut self, space: SpaceId, count: u64) {
+        assert_ne!(space, SpaceId::Data);
+        assert!(self.spaces[space].crypto.is_some());
+        self.spaces[space].sent_with_keys = count;
+    }
+
+    /// Queue a controlled peer STOP for duplicate/error-code input tests.
+    #[cfg(test)]
+    pub(crate) fn queue_stop_for_test(&mut self, id: StreamId, error_code: VarInt) {
+        self.spaces[SpaceId::Data]
+            .pending
+            .stop_sending
+            .push(frame::StopSending { id, error_code });
+    }
+
+    /// Exercises ACK serialization capacity without marking an ACK as sent.
+    #[cfg(test)]
+    pub(crate) fn try_ack_capacity_for_test(
+        &mut self,
+        now: Instant,
+        max_size: usize,
+    ) -> (Vec<u8>, Option<u64>) {
+        let mut payload = Vec::new();
+        let mut sent = SentFrames::default();
+        Self::try_populate_acks(
+            now,
+            self.receiving_ecn,
+            &mut sent,
+            &mut self.spaces[SpaceId::Data],
+            &mut payload,
+            &mut self.stats,
+            max_size,
+        );
+        (payload, sent.largest_acked)
+    }
+
+    /// Make the real peer composer emit a controlled, possibly invalid ACK.
+    #[cfg(test)]
+    pub(crate) fn queue_ack_for_pto_test(
+        &mut self,
+        now: Instant,
+        ranges: &[std::ops::RangeInclusive<u64>],
+    ) {
+        self.queue_ack_in_space_for_pto_test(now, SpaceId::Data, ranges);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_ack_in_space_for_pto_test(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        ranges: &[std::ops::RangeInclusive<u64>],
+    ) {
+        let pending = &mut self.spaces[space].pending_acks;
+        *pending = PacketSpace::new(now).pending_acks;
+        for range in ranges {
+            for pn in range.clone() {
+                pending.insert_one(pn, now);
+            }
+        }
+        pending.set_immediate_ack_required();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pto_state_for_test(&self, space: SpaceId) -> (u64, u32, bool, usize) {
+        (
+            self.spaces[space].next_packet_number,
+            self.spaces[space].loss_probes,
+            self.single_probe_with_gap(space),
+            self.packet_number_filter.pto_skip_count_for_test(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_immediate_ack_for_pto_test(&mut self) {
+        self.spaces[SpaceId::Data].immediate_ack_pending = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loss_timeout_for_pto_test(&self) -> Option<Instant> {
+        self.timers.get(Timer::LossDetection)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pto_timing_for_test(&self) -> PtoTimingSnapshot {
+        let space = &self.spaces[SpaceId::Data];
+        let (variance, sampled) = self.path.rtt.timing_inputs_for_test();
+        let mut in_flight = space
+            .sent_packets
+            .values()
+            .filter(|packet| packet.size != 0);
+        PtoTimingSnapshot {
+            smoothed: self.path.rtt.get(),
+            variance,
+            sampled,
+            max_ack_delay: self.ack_frequency.max_ack_delay_for_pto(),
+            backoff: self.pto_count,
+            first_in_flight: in_flight.next().map(|packet| packet.time_sent),
+            last_in_flight: space
+                .sent_packets
+                .values()
+                .rev()
+                .find(|packet| packet.size != 0)
+                .map(|packet| packet.time_sent),
+            last_ack_eliciting: space.time_of_last_ack_eliciting_packet,
+            deadline: self.timers.get(Timer::LossDetection),
+            handshaking: self.is_handshaking(),
+            has_data_keys: space.crypto.is_some(),
+            has_handshake_keys: self.spaces[SpaceId::Handshake].crypto.is_some(),
+            data_acknowledged: space.largest_acked_packet.is_some(),
+            handshake_in_flight: self.spaces[SpaceId::Handshake]
+                .sent_packets
+                .values()
+                .any(|packet| packet.size != 0),
+            confirmed: self.handshake_confirmed(),
+            first_1rtt_boundary: self.first_1rtt_packet_number,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pto_candidate_for_timing_test(&self, now: Instant) -> Option<(Instant, SpaceId)> {
+        self.pto_time_and_space(now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loss_candidate_for_alarm_test(&self) -> Option<(Instant, SpaceId)> {
+        self.loss_time_and_space()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_state_for_pto_test(&self, number: u64) -> (Option<u64>, bool) {
+        let space = &self.spaces[SpaceId::Data];
+        (
+            space.largest_sent_packet,
+            space.sent_packets.contains_key(&number),
+        )
+    }
+
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests
     #[cfg(test)]
     pub(crate) fn decode_packet(&self, event: &ConnectionEvent) -> Option<Vec<u8>> {
+        self.decode_packet_with_number(event)
+            .map(|(_, payload)| payload)
+    }
+
+    /// Returns the authenticated packet number and payload; unprotected packets
+    /// retain the existing decoder behavior with no packet number.
+    #[cfg(test)]
+    pub(crate) fn decode_packet_with_number(
+        &self,
+        event: &ConnectionEvent,
+    ) -> Option<(Option<u64>, Vec<u8>)> {
         let (first_decode, remaining) = match &event.0 {
             ConnectionEventInner::Datagram(DatagramConnectionEvent {
                 first_decode,
@@ -3930,7 +4575,7 @@ impl Connection {
         )?;
 
         let mut packet = decrypted_header.packet?;
-        packet_crypto::decrypt_packet_body(
+        let decrypted = packet_crypto::decrypt_packet_body(
             &mut packet,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
@@ -3940,7 +4585,10 @@ impl Connection {
         )
         .ok()?;
 
-        Some(packet.payload.to_vec())
+        Some((
+            decrypted.map(|result| result.number),
+            packet.payload.to_vec(),
+        ))
     }
 
     /// The number of bytes of packets containing retransmittable frames that have not been

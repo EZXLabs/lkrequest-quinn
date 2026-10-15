@@ -69,7 +69,8 @@ impl PathData {
             .build(now, config.get_initial_mtu());
         Self {
             remote,
-            rtt: RttEstimator::new(config.initial_rtt),
+            rtt: RttEstimator::new(config.initial_rtt)
+                .with_chrome_quantization(config.chrome_rtt_quantization),
             sending_ecn: config.enable_ecn,
             pacing: Pacer::new(
                 config.initial_rtt,
@@ -140,7 +141,8 @@ impl PathData {
     ///
     /// This is useful when it is known the underlying path has changed.
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
-        self.rtt = RttEstimator::new(config.initial_rtt);
+        self.rtt = RttEstimator::new(config.initial_rtt)
+            .with_chrome_quantization(config.chrome_rtt_quantization);
         self.congestion = config
             .congestion_controller_factory
             .clone()
@@ -297,6 +299,12 @@ pub struct RttEstimator {
     var: Duration,
     /// The minimum RTT seen in the connection, ignoring ack delay.
     min: Duration,
+    /// Quantize smoothed RTT and variation using Chrome's microsecond recurrence.
+    chrome_quantization: bool,
+    /// Loss timing uses the EWMA from before the last accepted sample.
+    previous_smoothed: Duration,
+    /// Keep the adjusted sample separate from the public raw latest RTT.
+    loss_latest: Duration,
 }
 
 impl RttEstimator {
@@ -306,7 +314,16 @@ impl RttEstimator {
             smoothed: None,
             var: initial_rtt / 2,
             min: initial_rtt,
+            chrome_quantization: false,
+            previous_smoothed: Duration::ZERO,
+            loss_latest: Duration::ZERO,
         }
+    }
+
+    /// Select S/V arithmetic; raw latest/minimum RTT retain their existing semantics.
+    pub(crate) fn with_chrome_quantization(mut self, enabled: bool) -> Self {
+        self.chrome_quantization = enabled;
+        self
     }
 
     /// The current best RTT estimation.
@@ -322,9 +339,20 @@ impl RttEstimator {
         self.get().max(self.latest)
     }
 
+    pub(crate) fn chrome_loss_rtt(&self) -> Duration {
+        self.previous_smoothed
+            .max(self.loss_latest)
+            .max(TIMER_GRANULARITY)
+    }
+
     /// Minimum RTT registered so far for this estimator.
     pub fn min(&self) -> Duration {
         self.min
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timing_inputs_for_test(&self) -> (Duration, bool) {
+        (self.var, self.smoothed.is_some())
     }
 
     // PTO computed as described in RFC9002#6.2.1
@@ -332,10 +360,24 @@ impl RttEstimator {
         self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
     }
 
+    pub(crate) fn sampled_rtt_inputs(&self) -> Option<(Duration, Duration)> {
+        self.smoothed.map(|rtt| (rtt, self.var))
+    }
+
     pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
+        if self.chrome_quantization {
+            self.update_chrome_quantized(ack_delay, rtt);
+            return;
+        }
+        self.previous_smoothed = self.smoothed.unwrap_or(Duration::ZERO);
         self.latest = rtt;
         // min_rtt ignores ack delay.
         self.min = cmp::min(self.min, self.latest);
+        self.loss_latest = if self.smoothed.is_some() && self.min + ack_delay <= rtt {
+            rtt - ack_delay
+        } else {
+            rtt
+        };
         // Based on RFC6298.
         if let Some(smoothed) = self.smoothed {
             let adjusted_rtt = if self.min + ack_delay <= self.latest {
@@ -350,6 +392,45 @@ impl RttEstimator {
             self.smoothed = Some(self.latest);
             self.var = self.latest / 2;
             self.min = self.latest;
+        }
+    }
+
+    fn update_chrome_quantized(&mut self, ack_delay: Duration, rtt: Duration) {
+        let raw_us = rtt.as_micros();
+        // QUICHE rejects zero and infinite signed-microsecond deltas. Keep
+        // unrepresentable Duration inputs from wrapping or entering float math.
+        if raw_us == 0 || raw_us >= i64::MAX as u128 {
+            return;
+        }
+        let raw_us = raw_us as u64;
+        self.previous_smoothed = self.smoothed.unwrap_or(Duration::ZERO);
+        self.latest = rtt;
+        self.min = cmp::min(self.min, rtt);
+        let sample_us = if self.smoothed.is_some()
+            && u128::from(raw_us) - self.min.as_micros() >= ack_delay.as_micros()
+        {
+            raw_us - ack_delay.as_micros() as u64
+        } else {
+            raw_us
+        };
+        self.loss_latest = Duration::from_micros(sample_us);
+        if let Some(smoothed) = self.smoothed {
+            let smoothed_us = u64::try_from(smoothed.as_micros()).unwrap_or(u64::MAX);
+            let variation_us = u64::try_from(self.var.as_micros()).unwrap_or(u64::MAX);
+            let deviation_us = smoothed_us.abs_diff(sample_us);
+            // QUICHE uses unfused float operations for V, but separately
+            // rounded double-duration products for S. The distinction matters.
+            let variation = 0.75_f32 * variation_us as f32 + 0.25_f32 * deviation_us as f32;
+            self.var = Duration::from_micros(variation as u64);
+            let old_weighted = (0.875_f64 * smoothed_us as f64).round() as u64;
+            let new_weighted = (0.125_f64 * sample_us as f64).round() as u64;
+            self.smoothed = Some(Duration::from_micros(
+                old_weighted.saturating_add(new_weighted),
+            ));
+        } else {
+            self.smoothed = Some(Duration::from_micros(raw_us));
+            self.var = Duration::from_micros(raw_us / 2);
+            self.min = rtt;
         }
     }
 }
@@ -460,6 +541,38 @@ impl InFlight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pto_clock_path_creation_copy_and_reset_preserve_quantization_policy() {
+        let now = Instant::now();
+        let remote = "203.0.113.1:4433".parse().unwrap();
+        for enabled in [false, true] {
+            let config = TransportConfig {
+                chrome_rtt_quantization: enabled,
+                ..TransportConfig::default()
+            };
+            let mut path = PathData::new(remote, false, None, 0, now, &config);
+            path.rtt.update(Duration::ZERO, Duration::from_micros(4));
+            path.rtt.update(Duration::ZERO, Duration::from_micros(4));
+            let expected = Duration::from_micros(if enabled { 5 } else { 4 });
+            assert_eq!(path.rtt.get(), expected);
+
+            let mut copied = PathData::from_previous(remote, &path, 1, now);
+            assert_eq!(
+                copied.rtt.sampled_rtt_inputs(),
+                path.rtt.sampled_rtt_inputs()
+            );
+            copied.rtt.update(Duration::ZERO, Duration::from_micros(4));
+            assert_eq!(copied.rtt.get(), expected);
+
+            copied.reset(now, &config);
+            assert!(copied.rtt.sampled_rtt_inputs().is_none());
+            assert_eq!(copied.rtt.get(), config.initial_rtt);
+            copied.rtt.update(Duration::ZERO, Duration::from_micros(4));
+            copied.rtt.update(Duration::ZERO, Duration::from_micros(4));
+            assert_eq!(copied.rtt.get(), expected);
+        }
+    }
 
     #[test]
     fn reset_refreshes_pacer_budget() {

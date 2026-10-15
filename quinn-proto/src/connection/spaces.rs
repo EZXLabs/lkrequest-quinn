@@ -30,6 +30,8 @@ pub(super) struct PacketSpace {
     /// The packet number of the next packet that will be sent, if any. In the Data space, the
     /// packet number stored here is sometimes skipped by [`PacketNumberFilter`] logic.
     pub(super) next_packet_number: u64,
+    /// Highest packet committed by the packet builder, including ACK-only packets.
+    pub(super) largest_sent_packet: Option<u64>,
     /// The largest packet number the remote peer acknowledged in an ACK frame.
     pub(super) largest_acked_packet: Option<u64>,
     pub(super) largest_acked_packet_sent: Instant,
@@ -80,6 +82,7 @@ impl PacketSpace {
             pending_acks: PendingAcks::new(),
 
             next_packet_number: 0,
+            largest_sent_packet: None,
             largest_acked_packet: None,
             largest_acked_packet_sent: now,
             largest_ack_eliciting_sent: 0,
@@ -216,6 +219,10 @@ impl PacketSpace {
 
     /// May return a packet that should be forgotten
     pub(super) fn sent(&mut self, number: u64, packet: SentPacket) -> Option<SentPacket> {
+        self.largest_sent_packet = Some(
+            self.largest_sent_packet
+                .map_or(number, |old| old.max(number)),
+        );
         // Retain state for at most this many non-ACK-eliciting packets sent after the most recently
         // sent ACK-eliciting packet. We're never guaranteed to receive an ACK for those, and we
         // can't judge them as lost without an ACK, so to limit memory in applications which receive
@@ -682,8 +689,11 @@ impl PendingAcks {
     }
 
     /// Whether any ACK frames can be sent in data-initiated packets
-    pub(super) fn can_send_with_other_frames(&self) -> bool {
+    pub(super) fn can_send_with_other_frames(&self, ack_obligation_only: bool) -> bool {
         !self.ranges.is_empty()
+            && (!ack_obligation_only
+                || self.ack_eliciting_since_last_ack_sent > 0
+                || self.immediate_ack_required)
     }
 
     /// Returns the delay since the packet with the largest packet number was received
@@ -853,6 +863,8 @@ pub(super) struct PacketNumberFilter {
     prev_skipped_packet_number: Option<u64>,
     /// Next packet number to skip is randomly selected from 2^n..2^n+1
     exponent: u32,
+    /// Deliberately unsent PTO packet numbers still relevant to ACK validation.
+    pto_skipped: ArrayRangeSet,
 }
 
 impl PacketNumberFilter {
@@ -863,6 +875,7 @@ impl PacketNumberFilter {
             next_skipped_packet_number: rng.random_range(0..2u64.saturating_pow(exponent)),
             prev_skipped_packet_number: None,
             exponent,
+            pto_skipped: ArrayRangeSet::new(),
         }
     }
 
@@ -872,6 +885,7 @@ impl PacketNumberFilter {
             next_skipped_packet_number: u64::MAX,
             prev_skipped_packet_number: None,
             exponent: u32::MAX,
+            pto_skipped: ArrayRangeSet::new(),
         }
     }
 
@@ -894,14 +908,68 @@ impl PacketNumberFilter {
         }
 
         trace!("skipping pn {n}");
-        // Skip this packet number, and choose the next one to skip
+        self.advance_random_skip(rng);
+
+        space.get_tx_number()
+    }
+
+    fn advance_random_skip(&mut self, rng: &mut (impl Rng + ?Sized)) {
         self.prev_skipped_packet_number = Some(self.next_skipped_packet_number);
         let next_exponent = self.exponent.saturating_add(1);
         self.next_skipped_packet_number = rng
             .random_range(2u64.saturating_pow(self.exponent)..2u64.saturating_pow(next_exponent));
         self.exponent = next_exponent;
+    }
 
-        space.get_tx_number()
+    /// Reserve an unsent number without bypassing either ACK-validation guard.
+    pub(super) fn skip_for_pto(
+        &mut self,
+        rng: &mut (impl Rng + ?Sized),
+        space: &mut PacketSpace,
+    ) -> Result<(), TransportError> {
+        // Leave a usable number after this gap, including an adjacent random skip.
+        let next = space.next_packet_number;
+        let required = if self.next_skipped_packet_number == next
+            || next.checked_add(1) == Some(self.next_skipped_packet_number)
+        {
+            3
+        } else {
+            2
+        };
+        if next.checked_add(required).is_none_or(|end| end > 1 << 62) {
+            return Err(TransportError::AEAD_LIMIT_REACHED(
+                "packet number exhausted",
+            ));
+        }
+        let skipped = space.get_tx_number();
+        self.pto_skipped.insert_one(skipped);
+        if skipped == self.next_skipped_packet_number {
+            self.advance_random_skip(rng);
+        }
+        Ok(())
+    }
+
+    pub(super) fn retire_pto_skips(&mut self, floor: u64) {
+        self.pto_skipped.remove(0..floor);
+    }
+
+    #[cfg(test)]
+    pub(super) fn pto_skip_count_for_test(&self) -> usize {
+        self.pto_skipped.len()
+    }
+
+    pub(super) fn check_pto_ack(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        floor: u64,
+    ) -> Result<(), TransportError> {
+        let start = (*range.start()).max(floor);
+        if self.pto_skipped.iter().any(|skipped| {
+            skipped.start <= *range.end() && skipped.end > start && start <= *range.end()
+        }) {
+            return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
+        }
+        Ok(())
     }
 
     pub(super) fn check_ack(
@@ -926,6 +994,137 @@ const MAX_ACK_BLOCKS: usize = 64;
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn pto_gap_filter_preserves_random_guard_and_multiple_live_gaps() {
+        for scheduled in [9, 10, 11] {
+            let mut rng = rand::rng();
+            let mut filter = PacketNumberFilter::disabled();
+            filter.next_skipped_packet_number = scheduled;
+            filter.exponent = 6;
+            let mut space = PacketSpace::new(Instant::now());
+            space.next_packet_number = 9;
+            if scheduled == 9 {
+                assert_eq!(filter.allocate(&mut rng, &mut space), 10);
+            } else {
+                assert_eq!(filter.allocate(&mut rng, &mut space), 9);
+            }
+            let first_gap = space.next_packet_number;
+            filter.skip_for_pto(&mut rng, &mut space).unwrap();
+            let first_probe = filter.allocate(&mut rng, &mut space);
+            assert!(first_probe > first_gap);
+            let second_gap = space.next_packet_number;
+            filter.skip_for_pto(&mut rng, &mut space).unwrap();
+            let second_probe = filter.allocate(&mut rng, &mut space);
+            assert_eq!(second_probe, second_gap + 1);
+            assert_eq!(filter.prev_skipped_packet_number, Some(scheduled));
+            assert!(
+                filter
+                    .check_ack(SpaceId::Data, scheduled..=scheduled)
+                    .is_err()
+            );
+            assert!(filter.check_pto_ack(first_gap..=second_probe, 0).is_err());
+            assert!(filter.check_pto_ack(second_gap..=second_gap, 0).is_err());
+            assert!(filter.check_pto_ack(first_probe..=first_probe, 0).is_ok());
+            filter.retire_pto_skips(second_gap);
+            assert!(
+                filter
+                    .check_pto_ack(first_gap..=first_gap, second_gap)
+                    .is_ok()
+            );
+            assert!(
+                filter
+                    .check_pto_ack(second_gap..=second_gap, second_gap)
+                    .is_err()
+            );
+            assert!(
+                filter
+                    .check_ack(SpaceId::Data, scheduled..=scheduled)
+                    .is_err()
+            );
+            assert!(
+                filter
+                    .check_ack(SpaceId::Handshake, scheduled..=scheduled)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn pto_gap_filter_overflow_does_not_allocate_or_mutate_guards() {
+        for next in [(1u64 << 62) - 1, 1u64 << 62, u64::MAX] {
+            let mut filter = PacketNumberFilter::disabled();
+            let mut space = PacketSpace::new(Instant::now());
+            space.next_packet_number = next;
+            let error = filter
+                .skip_for_pto(&mut rand::rng(), &mut space)
+                .unwrap_err();
+            assert_eq!(error.code, crate::TransportErrorCode::AEAD_LIMIT_REACHED);
+            assert_eq!(space.next_packet_number, next);
+            assert!(filter.pto_skipped.is_empty());
+            assert_eq!(filter.prev_skipped_packet_number, None);
+        }
+        let mut filter = PacketNumberFilter::disabled();
+        let mut space = PacketSpace::new(Instant::now());
+        space.next_packet_number = (1u64 << 62) - 2;
+        filter.skip_for_pto(&mut rand::rng(), &mut space).unwrap();
+        assert_eq!(
+            filter.allocate(&mut rand::rng(), &mut space),
+            (1u64 << 62) - 1
+        );
+    }
+
+    #[test]
+    fn pto_gap_filter_near_limit_random_collision_is_checked_before_mutation() {
+        for random_offset in [0, 1] {
+            let mut filter = PacketNumberFilter::disabled();
+            let mut space = PacketSpace::new(Instant::now());
+            space.next_packet_number = (1u64 << 62) - 2;
+            filter.next_skipped_packet_number = space.next_packet_number + random_offset;
+            filter.prev_skipped_packet_number = Some(7);
+            filter.exponent = 62;
+            let before = (
+                space.next_packet_number,
+                filter.next_skipped_packet_number,
+                filter.exponent,
+            );
+            let error = filter
+                .skip_for_pto(&mut rand::rng(), &mut space)
+                .unwrap_err();
+            assert_eq!(error.code, crate::TransportErrorCode::AEAD_LIMIT_REACHED);
+            assert_eq!(
+                (
+                    space.next_packet_number,
+                    filter.next_skipped_packet_number,
+                    filter.exponent
+                ),
+                before
+            );
+            assert!(filter.pto_skipped.is_empty());
+            assert_eq!(filter.prev_skipped_packet_number, Some(7));
+        }
+    }
+
+    #[test]
+    fn pto_gap_filter_live_gaps_survive_a_later_random_nonce() {
+        let mut filter = PacketNumberFilter::disabled();
+        let mut space = PacketSpace::new(Instant::now());
+        let mut rng = rand::rng();
+        filter.next_skipped_packet_number = 4;
+        filter.exponent = 6;
+        filter.skip_for_pto(&mut rng, &mut space).unwrap();
+        assert_eq!(filter.allocate(&mut rng, &mut space), 1);
+        filter.skip_for_pto(&mut rng, &mut space).unwrap();
+        assert_eq!(filter.allocate(&mut rng, &mut space), 3);
+        assert_eq!(filter.allocate(&mut rng, &mut space), 5);
+        assert_eq!(filter.prev_skipped_packet_number, Some(4));
+        for gap in [0, 2] {
+            assert!(filter.check_pto_ack(gap..=gap, 0).is_err());
+        }
+        assert!(filter.check_ack(SpaceId::Data, 4..=4).is_err());
+        assert!(filter.check_pto_ack(1..=5, 0).is_err());
+        assert!(filter.check_pto_ack(5..=5, 0).is_ok());
+    }
 
     #[test]
     fn sanity() {

@@ -383,6 +383,9 @@ impl RecvStream {
             ReadStatus::Readable(read) => Poll::Ready(Ok(Some(read))),
             ReadStatus::Finished(read) => {
                 self.all_data_read = true;
+                let reader = conn.blocked_readers.remove(&self.stream);
+                drop(conn);
+                drop(reader);
                 Poll::Ready(Ok(read))
             }
             ReadStatus::Failed(read, Blocked) => match read {

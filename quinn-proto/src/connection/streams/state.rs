@@ -212,6 +212,29 @@ impl StreamsState {
         }
     }
 
+    /// Apply newly negotiated limits to the local streams kept across early-data rejection.
+    pub(crate) fn update_reused_0rtt_send_limits(&mut self) {
+        let connection_writable = self.write_limit() > 0;
+        for (&id, entry) in &mut self.send {
+            if id.initiator() != self.side {
+                continue;
+            }
+            let Some(stream) = entry else { continue };
+            let limit = match id.dir() {
+                Dir::Uni => self.initial_max_stream_data_uni,
+                Dir::Bi => self.initial_max_stream_data_bidi_remote,
+            };
+            if stream.increase_max_data(limit.into()) {
+                if connection_writable {
+                    self.events.push_back(StreamEvent::Writable { id });
+                } else if !stream.connection_blocked {
+                    stream.connection_blocked = true;
+                    self.connection_blocked.push(id);
+                }
+            }
+        }
+    }
+
     /// Ensure we have space for at least a full flow control window of remotely-initiated streams
     /// to be open, and notify the peer if the window has moved
     fn ensure_remote_streams(&mut self, dir: Dir) {
@@ -366,6 +389,15 @@ impl StreamsState {
         })
     }
 
+    pub(crate) fn is_finished_unstopped(&self, id: StreamId) -> bool {
+        self.send
+            .get(&id)
+            .and_then(Option::as_ref)
+            .is_some_and(|stream| {
+                matches!(stream.state, SendState::DataSent { .. }) && stream.stop_reason.is_none()
+            })
+    }
+
     /// Process incoming `STOP_SENDING` frame
     #[allow(unreachable_pub)] // fuzzing only
     pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
@@ -409,6 +441,107 @@ impl StreamsState {
         })
     }
 
+    pub(crate) fn reset_is_outstanding(&self, id: StreamId) -> bool {
+        self.send
+            .get(&id)
+            .and_then(Option::as_ref)
+            .is_some_and(|stream| stream.is_reset())
+    }
+
+    /// Resolve an already transmitted frame against current ACK/reset state.
+    pub(crate) fn outstanding_probe_frames(&self, frames: &[frame::StreamMeta]) -> StreamMetaVec {
+        let mut outstanding = StreamMetaVec::new();
+        for frame in frames {
+            let Some(stream) = self.send.get(&frame.id).and_then(Option::as_ref) else {
+                continue;
+            };
+            if stream.is_reset() {
+                continue;
+            }
+            let mut fin = frame.fin
+                && matches!(
+                    stream.state,
+                    SendState::DataSent {
+                        finish_acked: false
+                    }
+                );
+            for offsets in stream.pending.unacked_ranges(frame.offsets.clone()).iter() {
+                let last = fin && offsets.end == frame.offsets.end;
+                outstanding.push(frame::StreamMeta {
+                    id: frame.id,
+                    offsets,
+                    fin: last,
+                });
+                fin &= !last;
+            }
+            if fin {
+                outstanding.push(frame::StreamMeta {
+                    id: frame.id,
+                    offsets: frame.offsets.end..frame.offsets.end,
+                    fin: true,
+                });
+            }
+        }
+        outstanding
+    }
+
+    /// Encode only selected old ranges, without consuming new application data.
+    pub(crate) fn write_probe_stream_frames(
+        &self,
+        frames: &[frame::StreamMeta],
+        buf: &mut Vec<u8>,
+        max_size: usize,
+    ) -> StreamMetaVec {
+        let mut sent = StreamMetaVec::new();
+        for frame in frames {
+            if buf.len() + frame::Stream::SIZE_BOUND >= max_size {
+                break;
+            }
+            let mut available = max_size - buf.len() - 1 - VarInt::size(frame.id.into());
+            if frame.offsets.start != 0 {
+                available -= VarInt::size(
+                    VarInt::try_from(frame.offsets.start).expect("valid stream offset"),
+                );
+            }
+            // Match SendBuffer::poll_transmit's packing without changing its
+            // unsent cursor or consuming the ordinary pending stream queue.
+            let encode_length = frame.offsets.end - frame.offsets.start < available as u64;
+            if encode_length {
+                available -= 8;
+            }
+            let stream = self
+                .send
+                .get(&frame.id)
+                .and_then(Option::as_ref)
+                .expect("probe frames were resolved against live streams");
+            let end = frame
+                .offsets
+                .end
+                .min(frame.offsets.start.saturating_add(available as u64));
+            let meta = frame::StreamMeta {
+                id: frame.id,
+                offsets: frame.offsets.start..end,
+                fin: frame.fin && end == frame.offsets.end,
+            };
+            meta.encode(encode_length, buf);
+            let mut remaining = meta.offsets.clone();
+            while !remaining.is_empty() {
+                let data = stream.pending.get(remaining.clone());
+                assert!(
+                    !data.is_empty(),
+                    "resolved probe bytes must remain retained"
+                );
+                remaining.start += data.len() as u64;
+                buf.put_slice(data);
+            }
+            sent.push(meta);
+            if end != frame.offsets.end {
+                break;
+            }
+        }
+        sent
+    }
+
     /// Whether MAX_STREAM_DATA frames could be sent for stream `id`
     pub(crate) fn can_send_flow_control(&self, id: StreamId) -> bool {
         self.recv
@@ -441,13 +574,32 @@ impl StreamsState {
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
         max_size: usize,
+        stop_before_matching_reset: bool,
     ) {
         // RESET_STREAM
-        while buf.len() + frame::ResetStream::SIZE_BOUND < max_size {
-            let (id, error_code) = match pending.reset_stream.pop() {
-                Some(x) => x,
-                None => break,
-            };
+        while let Some(&(id, error_code)) = pending.reset_stream.last() {
+            if stop_before_matching_reset && self.send.get(&id).and_then(Option::as_ref).is_some() {
+                if let Some(index) = pending
+                    .stop_sending
+                    .iter()
+                    .position(|stop| stop.id == id && stop.error_code == error_code)
+                {
+                    if buf.len() + frame::StopSending::SIZE_BOUND >= max_size {
+                        break;
+                    }
+                    // Keep unrelated STOPs in their existing order. The RESET
+                    // stays pending if this packet has room only for its STOP.
+                    let stop = pending.stop_sending.remove(index);
+                    trace!(stream = %stop.id, "STOP_SENDING");
+                    stop.encode(buf);
+                    retransmits.get_or_create().stop_sending.push(stop);
+                    stats.stop_sending += 1;
+                }
+            }
+            if buf.len() + frame::ResetStream::SIZE_BOUND >= max_size {
+                break;
+            }
+            pending.reset_stream.pop();
             let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
                 Some(x) => x,
                 None => continue,
@@ -734,11 +886,18 @@ impl StreamsState {
         if stream.is_reset() {
             return;
         }
-        if !stream.is_pending() {
+        let was_pending = stream.is_pending();
+        stream.fin_pending |= frame.fin
+            && matches!(
+                stream.state,
+                SendState::DataSent {
+                    finish_acked: false
+                }
+            );
+        stream.pending.retransmit(frame.offsets);
+        if !was_pending && stream.is_pending() {
             self.pending.push_pending(frame.id, stream.priority);
         }
-        stream.fin_pending |= frame.fin;
-        stream.pending.retransmit(frame.offsets);
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {
@@ -1046,7 +1205,7 @@ pub(super) fn get_or_insert_recv(
 mod tests {
     use super::*;
     use crate::{
-        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
+        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError, Written,
         connection::State as ConnState, connection::Streams,
     };
     use bytes::Bytes;
@@ -1060,6 +1219,372 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum CancelControl {
+        Reset(StreamId, u64, u64),
+        Stop(StreamId, u64),
+    }
+
+    fn queued_cancel_pair(stop_first: bool) -> (StreamsState, Retransmits, StreamId) {
+        let mut streams = make(Side::Client);
+        streams.set_params(&TransportParameters {
+            initial_max_streams_bidi: 8u32.into(),
+            initial_max_data: 4096u32.into(),
+            initial_max_stream_data_bidi_remote: 4096u32.into(),
+            ..TransportParameters::default()
+        });
+        let connection = ConnState::Established;
+        let id = Streams {
+            state: &mut streams,
+            conn_state: &connection,
+        }
+        .open(Dir::Bi)
+        .unwrap();
+        let mut pending = Retransmits::default();
+        SendStream {
+            id,
+            state: &mut streams,
+            pending: &mut pending,
+            conn_state: &connection,
+        }
+        .write(b"sent body")
+        .unwrap();
+        assert_eq!(
+            streams
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: false,
+                        data: Bytes::from_static(b"response"),
+                    },
+                    8,
+                )
+                .unwrap(),
+            ShouldTransmit(false)
+        );
+        if stop_first {
+            RecvStream {
+                id,
+                state: &mut streams,
+                pending: &mut pending,
+            }
+            .stop(268u32.into())
+            .unwrap();
+        }
+        SendStream {
+            id,
+            state: &mut streams,
+            pending: &mut pending,
+            conn_state: &connection,
+        }
+        .reset(268u32.into())
+        .unwrap();
+        if !stop_first {
+            RecvStream {
+                id,
+                state: &mut streams,
+                pending: &mut pending,
+            }
+            .stop(268u32.into())
+            .unwrap();
+        }
+        assert_eq!(pending.reset_stream, vec![(id, 268u32.into())]);
+        assert_eq!(pending.stop_sending.len(), 1);
+        (streams, pending, id)
+    }
+
+    fn decode_cancel_controls(encoded: Vec<u8>) -> Vec<CancelControl> {
+        if encoded.is_empty() {
+            return Vec::new();
+        }
+        frame::Iter::new(Bytes::from(encoded))
+            .unwrap()
+            .map(|frame| match frame.unwrap() {
+                frame::Frame::ResetStream(reset) => CancelControl::Reset(
+                    reset.id,
+                    reset.error_code.into_inner(),
+                    reset.final_offset.into_inner(),
+                ),
+                frame::Frame::StopSending(stop) => {
+                    CancelControl::Stop(stop.id, stop.error_code.into_inner())
+                }
+                unexpected => panic!("unexpected cancellation control frame: {unexpected:?}"),
+            })
+            .collect()
+    }
+
+    fn drain_cancel_controls(
+        streams: &mut StreamsState,
+        pending: &mut Retransmits,
+        max_size: usize,
+        prefer_stop: bool,
+    ) -> (Vec<CancelControl>, ThinRetransmits, FrameStats) {
+        let mut encoded = Vec::new();
+        let mut retransmits = ThinRetransmits::default();
+        let mut stats = FrameStats::default();
+        streams.write_control_frames(
+            &mut encoded,
+            pending,
+            &mut retransmits,
+            &mut stats,
+            max_size,
+            prefer_stop,
+        );
+        (decode_cancel_controls(encoded), retransmits, stats)
+    }
+
+    fn encoded_cancel_pair(stop_first: bool, prefer_stop: bool) -> (Vec<CancelControl>, StreamId) {
+        let (mut streams, mut pending, id) = queued_cancel_pair(stop_first);
+        let mut encoded = Vec::new();
+        let mut retransmits = ThinRetransmits::default();
+        let mut stats = FrameStats::default();
+        streams.write_control_frames(
+            &mut encoded,
+            &mut pending,
+            &mut retransmits,
+            &mut stats,
+            1200,
+            prefer_stop,
+        );
+        assert_eq!(stats.reset_stream, 1);
+        assert_eq!(stats.stop_sending, 1);
+        assert!(pending.reset_stream.is_empty());
+        assert!(pending.stop_sending.is_empty());
+        let frames = decode_cancel_controls(encoded);
+        eprintln!("cancel order stop_call_first={stop_first}: {frames:?}");
+        (frames, id)
+    }
+
+    #[test]
+    fn cancel_order_chrome_reset_then_stop() {
+        let (frames, id) = encoded_cancel_pair(false, true);
+        assert_eq!(
+            frames,
+            vec![
+                CancelControl::Stop(id, 268),
+                CancelControl::Reset(id, 268, 9)
+            ],
+            "a matching Chrome cancellation pair must serialize STOP before RESET"
+        );
+    }
+
+    #[test]
+    fn cancel_order_chrome_stop_then_reset() {
+        let (frames, id) = encoded_cancel_pair(true, true);
+        assert_eq!(
+            frames,
+            vec![
+                CancelControl::Stop(id, 268),
+                CancelControl::Reset(id, 268, 9)
+            ],
+            "calling STOP first must not be defeated by separate control queues"
+        );
+    }
+
+    #[test]
+    fn cancel_order_default_reset_first_in_both_call_orders() {
+        for stop_first in [false, true] {
+            let (frames, id) = encoded_cancel_pair(stop_first, false);
+            assert_eq!(
+                frames,
+                vec![
+                    CancelControl::Reset(id, 268, 9),
+                    CancelControl::Stop(id, 268)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_order_unmatched_stream_or_code_retains_reset_first() {
+        for different_stream in [false, true] {
+            let (mut streams, mut pending, id) = queued_cancel_pair(true);
+            let stop = &mut pending.stop_sending[0];
+            if different_stream {
+                stop.id = StreamId::new(Side::Client, Dir::Bi, 1);
+            } else {
+                stop.error_code = 256u32.into();
+            }
+            let stop = *stop;
+            let (frames, _, stats) = drain_cancel_controls(&mut streams, &mut pending, 1200, true);
+            assert_eq!(
+                frames,
+                vec![
+                    CancelControl::Reset(id, 268, 9),
+                    CancelControl::Stop(stop.id, stop.error_code.into_inner())
+                ]
+            );
+            assert_eq!((stats.reset_stream, stats.stop_sending), (1, 1));
+        }
+    }
+
+    #[test]
+    fn cancel_order_unpaired_controls_keep_their_existing_behavior() {
+        for reset_only in [false, true] {
+            let (mut streams, mut pending, id) = queued_cancel_pair(false);
+            if reset_only {
+                pending.stop_sending.clear();
+            } else {
+                pending.reset_stream.clear();
+            }
+            let (frames, _, stats) = drain_cancel_controls(&mut streams, &mut pending, 1200, true);
+            if reset_only {
+                assert_eq!(frames, vec![CancelControl::Reset(id, 268, 9)]);
+                assert_eq!((stats.reset_stream, stats.stop_sending), (1, 0));
+            } else {
+                assert_eq!(frames, vec![CancelControl::Stop(id, 268)]);
+                assert_eq!((stats.reset_stream, stats.stop_sending), (0, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_order_pair_does_not_shuffle_unrelated_stops() {
+        let (mut streams, mut pending, id) = queued_cancel_pair(false);
+        let first_unrelated = StreamId::new(Side::Client, Dir::Bi, 1);
+        let last_unrelated = StreamId::new(Side::Client, Dir::Bi, 2);
+        pending.stop_sending.insert(
+            0,
+            frame::StopSending {
+                id: first_unrelated,
+                error_code: 42u32.into(),
+            },
+        );
+        pending.stop_sending.push(frame::StopSending {
+            id: last_unrelated,
+            error_code: 43u32.into(),
+        });
+        let (frames, retransmits, stats) =
+            drain_cancel_controls(&mut streams, &mut pending, 1200, true);
+        assert_eq!(
+            frames,
+            vec![
+                CancelControl::Stop(id, 268),
+                CancelControl::Reset(id, 268, 9),
+                CancelControl::Stop(last_unrelated, 43),
+                CancelControl::Stop(first_unrelated, 42),
+            ]
+        );
+        assert_eq!((stats.reset_stream, stats.stop_sending), (1, 3));
+        assert_eq!(retransmits.get().unwrap().stop_sending.len(), 3);
+    }
+
+    #[test]
+    fn cancel_order_stop_only_packet_keeps_reset_pending_and_unacked() {
+        let (mut streams, mut pending, id) = queued_cancel_pair(false);
+        let (frames, stop_packet, stats) = drain_cancel_controls(
+            &mut streams,
+            &mut pending,
+            frame::StopSending::SIZE_BOUND + 1,
+            true,
+        );
+        assert_eq!(frames, vec![CancelControl::Stop(id, 268)]);
+        assert_eq!((stats.reset_stream, stats.stop_sending), (0, 1));
+        assert_eq!(pending.reset_stream, vec![(id, 268u32.into())]);
+        assert!(pending.stop_sending.is_empty());
+        assert!(stop_packet.get().unwrap().reset_stream.is_empty());
+        for (reset_id, _) in &stop_packet.get().unwrap().reset_stream {
+            streams.reset_acked(*reset_id);
+        }
+        assert!(streams.send.contains_key(&id));
+
+        let (frames, reset_packet, stats) =
+            drain_cancel_controls(&mut streams, &mut pending, 1200, true);
+        assert_eq!(frames, vec![CancelControl::Reset(id, 268, 9)]);
+        assert_eq!((stats.reset_stream, stats.stop_sending), (1, 0));
+        assert!(reset_packet.get().unwrap().stop_sending.is_empty());
+        for (reset_id, _) in &reset_packet.get().unwrap().reset_stream {
+            streams.reset_acked(*reset_id);
+        }
+        assert!(!streams.send.contains_key(&id));
+        assert!(pending.reset_stream.is_empty());
+    }
+
+    #[test]
+    fn cancel_order_insufficient_space_preserves_both_controls() {
+        for prefer_stop in [false, true] {
+            let (mut streams, mut pending, id) = queued_cancel_pair(false);
+            let (frames, retransmits, stats) = drain_cancel_controls(
+                &mut streams,
+                &mut pending,
+                frame::StopSending::SIZE_BOUND,
+                prefer_stop,
+            );
+            assert!(frames.is_empty());
+            assert_eq!((stats.reset_stream, stats.stop_sending), (0, 0));
+            assert!(retransmits.get().is_none());
+            assert_eq!(pending.reset_stream, vec![(id, 268u32.into())]);
+            assert_eq!(pending.stop_sending.len(), 1);
+        }
+    }
+
+    #[test]
+    fn cancel_order_missing_send_state_keeps_stop_and_legacy_budget_behavior() {
+        for prefer_stop in [false, true] {
+            let (mut streams, mut pending, id) = queued_cancel_pair(false);
+            streams.send.remove(&id);
+            let (frames, _, stats) = drain_cancel_controls(
+                &mut streams,
+                &mut pending,
+                frame::StopSending::SIZE_BOUND,
+                prefer_stop,
+            );
+            assert!(frames.is_empty());
+            assert_eq!((stats.reset_stream, stats.stop_sending), (0, 0));
+            assert_eq!(pending.reset_stream.len(), 1);
+            let (frames, retransmits, stats) =
+                drain_cancel_controls(&mut streams, &mut pending, 1200, prefer_stop);
+            assert_eq!(frames, vec![CancelControl::Stop(id, 268)]);
+            assert_eq!((stats.reset_stream, stats.stop_sending), (0, 1));
+            assert!(retransmits.get().unwrap().reset_stream.is_empty());
+            assert!(pending.reset_stream.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancel_order_loss_requeue_preserves_pair_offset_and_flow_state() {
+        let (mut streams, mut pending, id) = queued_cancel_pair(false);
+        let flow_before = (
+            streams.buffered_data,
+            streams.send_window,
+            streams.local_max_data,
+            streams.data_recvd,
+        );
+        let (first, retransmits, first_stats) =
+            drain_cancel_controls(&mut streams, &mut pending, 1200, true);
+        pending |= retransmits;
+        let (second, retransmits, second_stats) =
+            drain_cancel_controls(&mut streams, &mut pending, 1200, true);
+        assert_eq!(
+            first,
+            vec![
+                CancelControl::Stop(id, 268),
+                CancelControl::Reset(id, 268, 9)
+            ]
+        );
+        assert_eq!(second, first);
+        assert_eq!((first_stats.reset_stream, first_stats.stop_sending), (1, 1));
+        assert_eq!(
+            (second_stats.reset_stream, second_stats.stop_sending),
+            (1, 1)
+        );
+        assert_eq!(
+            retransmits.get().unwrap().reset_stream,
+            vec![(id, 268u32.into())]
+        );
+        assert_eq!(retransmits.get().unwrap().stop_sending.len(), 1);
+        assert_eq!(
+            (
+                streams.buffered_data,
+                streams.send_window,
+                streams.local_max_data,
+                streams.data_recvd
+            ),
+            flow_before
+        );
     }
 
     #[test]
@@ -1541,6 +2066,69 @@ mod tests {
                 .code,
             TransportErrorCode::FLOW_CONTROL_ERROR
         );
+    }
+
+    fn stopped_write_at_zero_limit(
+        peer_limit: bool,
+        error_code: VarInt,
+    ) -> (
+        Result<usize, WriteError>,
+        Result<Written, WriteError>,
+        Result<usize, WriteError>,
+    ) {
+        let mut server = make(Side::Server);
+        server.send_window = if peer_limit { 1000 } else { 16 };
+        server.set_params(&TransportParameters {
+            initial_max_streams_uni: 1u32.into(),
+            initial_max_data: if peer_limit { 16u32 } else { 1000u32 }.into(),
+            initial_max_stream_data_uni: 1000u32.into(),
+            ..TransportParameters::default()
+        });
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let id = Streams {
+            state: &mut server,
+            conn_state: &state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        let mut stream = SendStream {
+            id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        assert_eq!(stream.write(&[7; 16]), Ok(16));
+        assert_eq!(stream.state.write_limit(), 0);
+        assert_eq!(stream.write(&[8]), Err(WriteError::Blocked));
+        stream.state.received_stop_sending(id, error_code);
+        let stopped_write = stream.write(&[8]);
+        let mut chunks = [Bytes::from_static(b"blocked")];
+        let stopped_chunks = stream.write_chunks(&mut chunks);
+        assert_eq!(chunks[0], b"blocked".as_slice());
+        assert_eq!(stream.state.data_sent, 16);
+        stream.reset(error_code).unwrap();
+        let closed_write = stream.write(&[8]);
+        (stopped_write, stopped_chunks, closed_write)
+    }
+
+    #[test]
+    fn stopped_write_when_local_send_window_is_exhausted() {
+        for error_code in [0u32, 256, 268].map(VarInt::from) {
+            let (write, chunks, closed) = stopped_write_at_zero_limit(false, error_code);
+            assert_eq!(write, Err(WriteError::Stopped(error_code)));
+            assert_eq!(chunks, Err(WriteError::Stopped(error_code)));
+            assert_eq!(closed, Err(WriteError::ClosedStream));
+        }
+    }
+
+    #[test]
+    fn stopped_write_when_peer_connection_window_is_exhausted() {
+        for error_code in [0u32, 256, 268].map(VarInt::from) {
+            let (write, chunks, closed) = stopped_write_at_zero_limit(true, error_code);
+            assert_eq!(write, Err(WriteError::Stopped(error_code)));
+            assert_eq!(chunks, Err(WriteError::Stopped(error_code)));
+            assert_eq!(closed, Err(WriteError::ClosedStream));
+        }
     }
 
     #[test]

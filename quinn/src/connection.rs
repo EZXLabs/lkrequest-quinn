@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     future::Future,
     io,
@@ -96,9 +97,12 @@ impl Connecting {
     /// _accept_ the 0-RTT data**--yet still accept the connection attempt in general. This
     /// possibility is conveyed through the [`ZeroRttAccepted`] future--when the handshake
     /// completes, it resolves to true if the 0-RTT data was accepted and false if it was rejected.
-    /// If it was rejected, the existence of streams opened and other application data sent prior
-    /// to the handshake completing will not be conveyed to the remote application, and local
-    /// operations on them will return `ZeroRttRejected` errors.
+    /// By default, rejection discards streams opened and data sent before handshake completion,
+    /// and local operations on those streams return `ZeroRttRejected` errors. If explicitly
+    /// configured and the rejection meets the crypto and transport requirements,
+    /// [`Connection::rejected_0rtt_streams_reused`] instead reports that the original streams
+    /// remain usable and their data will be retransmitted in 1-RTT. This does not change the
+    /// `false` result from [`ZeroRttAccepted`].
     ///
     /// A server may reject 0-RTT data at its discretion, but accepting 0-RTT data requires the
     /// relevant resumption state to be stored in the server, which servers may limit or lose for
@@ -264,10 +268,34 @@ impl Future for ConnectionDriver {
         let _guard = self.span.enter();
 
         if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+            conn.queued_pto_transmits.clear();
             conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                // A received close can precede failure to send its reply in this poll.
+                conn.forward_app_events(&self.conn.shared);
+                let reason = conn.error.clone().unwrap_or_else(|| {
+                    ConnectionError::TransportError(proto::TransportError {
+                        code: proto::TransportErrorCode::INTERNAL_ERROR,
+                        frame: None,
+                        reason: format!("UDP send failed: {error}"),
+                    })
+                });
+                conn.inner.abort(reason.clone());
+                conn.buffered_transmit = None;
+                conn.send_buffer.clear();
+                conn.queued_pto_transmits.clear();
+                conn.timer = None;
+                conn.timer_deadline = None;
+                conn.driver = None;
+                conn.terminate(reason, &self.conn.shared);
+                conn.forward_endpoint_events();
+                return Poll::Ready(Err(error));
+            }
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -307,6 +335,19 @@ impl Future for ConnectionDriver {
 /// [`Connection::close()`]: Connection::close
 #[derive(Debug, Clone)]
 pub struct Connection(ConnectionRef);
+
+#[cfg(test)]
+impl Connection {
+    pub(crate) fn pto_queue_ciphertexts_for_test(&self) -> Vec<Vec<u8>> {
+        self.0
+            .state
+            .lock("pto_queue_test")
+            .queued_pto_transmits
+            .iter()
+            .map(|(_, bytes)| bytes.clone())
+            .collect()
+    }
+}
 
 impl Connection {
     /// Initiate a new outgoing unidirectional stream.
@@ -402,6 +443,19 @@ impl Connection {
     /// Returns `None` if the connection is still open.
     pub fn close_reason(&self) -> Option<ConnectionError> {
         self.0.state.lock("close_reason").error.clone()
+    }
+
+    /// Whether rejected 0-RTT streams were retained for retransmission in 1-RTT.
+    ///
+    /// This records a completed handshake outcome, not whether the connection is
+    /// currently open. It remains true after a later connection error. The
+    /// [`ZeroRttAccepted`] future still reports the peer's actual rejection.
+    pub fn rejected_0rtt_streams_reused(&self) -> bool {
+        self.0
+            .state
+            .lock("rejected_0rtt_streams_reused")
+            .inner
+            .rejected_0rtt_streams_reused()
     }
 
     /// Close the connection immediately.
@@ -929,6 +983,7 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                queued_pto_transmits: VecDeque::new(),
             }),
             shared: Shared::default(),
         }))
@@ -1013,6 +1068,8 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    /// Already committed PTO datagrams behind the lower writer's pending datagram.
+    queued_pto_transmits: VecDeque<(proto::Transmit, Vec<u8>)>,
 }
 
 impl State {
@@ -1030,6 +1087,12 @@ impl State {
             let t = match self.buffered_transmit.take() {
                 Some(t) => t,
                 None => {
+                    if let Some((transmit, bytes)) = self.queued_pto_transmits.pop_front() {
+                        self.send_buffer = bytes;
+                        self.buffered_transmit = Some(transmit);
+                        transmits += 1;
+                        continue;
+                    }
                     self.send_buffer.clear();
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
                     match self
@@ -1049,9 +1112,14 @@ impl State {
             };
 
             if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
+                if self.inner.discard_blocked_close() {
+                    self.send_buffer.clear();
+                    self.queued_pto_transmits.clear();
+                    return Ok(false);
+                }
                 // Retry after a future wakeup
                 self.buffered_transmit = Some(t);
-                return Ok(false);
+                return Ok(self.queue_blocked_pto(now));
             }
 
             let len = t.size;
@@ -1064,6 +1132,11 @@ impl State {
                 Err(e) => return Err(e),
             };
             if retry {
+                if self.inner.discard_blocked_close() {
+                    self.send_buffer.clear();
+                    self.queued_pto_transmits.clear();
+                    return Ok(false);
+                }
                 // We thought the socket was writable, but it wasn't. Retry so that either another
                 // `poll_writable` call determines that the socket is indeed not writable and
                 // registers us for a wakeup, or the send succeeds if this really was just a
@@ -1082,6 +1155,21 @@ impl State {
         }
 
         Ok(false)
+    }
+
+    fn queue_blocked_pto(&mut self, now: Instant) -> bool {
+        if !self.inner.can_queue_pto_while_blocked() {
+            return false;
+        }
+        let mut bytes = Vec::with_capacity(self.inner.current_mtu() as usize);
+        let Some(transmit) = self.inner.poll_blocked_pto_transmit(now, &mut bytes) else {
+            return false;
+        };
+        self.queued_pto_transmits.push_back((transmit, bytes));
+        // An independent custom configuration may allow more than one probe.
+        // Only reschedule while another granted credit remains; never spin on
+        // application data or on a blocked socket without a probe opportunity.
+        self.inner.can_queue_pto_while_blocked()
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1105,7 +1193,10 @@ impl State {
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                    let was_closed = self.inner.is_closed();
+                    let was_draining = self.inner.is_draining();
                     self.inner.handle_event(event);
+                    self.discard_buffer_on_terminal_transition(was_closed, was_draining);
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
                     self.close(error_code, reason, shared);
@@ -1140,11 +1231,16 @@ impl State {
                         let _ = x.send(self.inner.accepted_0rtt());
                     }
                     if self.inner.side().is_client() && !self.inner.accepted_0rtt() {
-                        // Wake up rejected 0-RTT streams so they can fail immediately with
-                        // `ZeroRttRejected` errors.
+                        // Recheck the completed handshake: discarded streams fail,
+                        // while retained streams continue with their original handles.
                         wake_all(&mut self.blocked_writers);
                         wake_all(&mut self.blocked_readers);
                         wake_all_notify(&mut self.stopped);
+                        if self.inner.rejected_0rtt_streams_reused() {
+                            // The peer's final limits may allow additional streams.
+                            shared.stream_budget_available[Dir::Uni as usize].notify_waiters();
+                            shared.stream_budget_available[Dir::Bi as usize].notify_waiters();
+                        }
                     }
                 }
                 ConnectionLost { reason } => {
@@ -1188,7 +1284,7 @@ impl State {
         // deadlines.
         let now = self.runtime.now();
         if now >= deadline {
-            self.inner.handle_timeout(now);
+            self.handle_timeout(now);
             self.timer_deadline = None;
             return true;
         }
@@ -1215,9 +1311,29 @@ impl State {
         }
 
         // The deadline elapsed in the window between the clock check and poll.
-        self.inner.handle_timeout(self.runtime.now());
+        self.handle_timeout(self.runtime.now());
         self.timer_deadline = None;
         true
+    }
+
+    fn handle_timeout(&mut self, now: Instant) {
+        let was_closed = self.inner.is_closed();
+        let was_draining = self.inner.is_draining();
+        self.inner.handle_timeout(now);
+        self.discard_buffer_on_terminal_transition(was_closed, was_draining);
+    }
+
+    fn discard_buffer_on_terminal_transition(&mut self, was_closed: bool, was_draining: bool) {
+        if (!was_closed && self.inner.is_closed())
+            || (!was_draining && self.inner.is_draining())
+            || self.inner.is_drained()
+        {
+            // Invalidate the old phase's packet. A new close remains retryable
+            // in the same phase unless the configured blocked-close policy suppresses it.
+            self.buffered_transmit = None;
+            self.send_buffer.clear();
+            self.queued_pto_transmits.clear();
+        }
     }
 
     /// Wake up a blocked `Driver` task to process I/O
@@ -1249,7 +1365,15 @@ impl State {
     }
 
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
+        let was_closed = self.inner.is_closed();
+        let was_draining = self.inner.is_draining();
+        let writer_blocked =
+            self.buffered_transmit.is_some() || !self.queued_pto_transmits.is_empty();
         self.inner.close(self.runtime.now(), error_code, reason);
+        if !was_closed && writer_blocked {
+            self.inner.discard_blocked_close();
+        }
+        self.discard_buffer_on_terminal_transition(was_closed, was_draining);
         self.terminate(ConnectionError::LocallyClosed, shared);
         self.wake();
     }
@@ -1262,6 +1386,7 @@ impl State {
     pub(crate) fn check_0rtt(&self) -> Result<(), ()> {
         if self.inner.is_handshaking()
             || self.inner.accepted_0rtt()
+            || self.inner.rejected_0rtt_streams_reused()
             || self.inner.side().is_server()
         {
             Ok(())

@@ -47,6 +47,7 @@ impl SendBuffer {
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
+        self.retransmits.remove(range.clone());
         self.acks.insert(range);
 
         while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
@@ -171,7 +172,17 @@ impl SendBuffer {
     /// Queue a range of sent but unacknowledged data to be retransmitted
     pub(super) fn retransmit(&mut self, range: Range<u64>) {
         debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
-        self.retransmits.insert(range);
+        let outstanding = self.unacked_ranges(range);
+        self.retransmits.add(&outstanding);
+    }
+
+    /// Still-retained bytes of an earlier transmission, excluding acknowledged holes.
+    pub(super) fn unacked_ranges(&self, range: Range<u64>) -> RangeSet {
+        let mut result = RangeSet::new();
+        let base = self.offset - self.unacked_len as u64;
+        result.insert(range.start.max(base)..range.end.min(self.unsent));
+        result.subtract(&self.acks);
+        result
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
@@ -206,6 +217,36 @@ impl SendBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pto_write_queue_buffer_retransmits_only_unacked_holes() {
+        let mut buffer = SendBuffer::new();
+        buffer.write(Bytes::from_static(b"abcdef"));
+        assert_eq!(buffer.poll_transmit(64).0, 0..6);
+        buffer.ack(0..2);
+        buffer.ack(4..5);
+        assert_eq!(
+            buffer.unacked_ranges(0..6).iter().collect::<Vec<_>>(),
+            vec![2..4, 5..6]
+        );
+        buffer.retransmit(0..6);
+        assert_eq!(buffer.poll_transmit(64).0, 2..4);
+        assert_eq!(buffer.poll_transmit(64).0, 5..6);
+    }
+
+    #[test]
+    fn pto_write_queue_buffer_ack_removes_an_already_queued_lost_copy() {
+        let mut buffer = SendBuffer::new();
+        buffer.write(Bytes::from_static(b"prefix"));
+        assert_eq!(buffer.poll_transmit(64).0, 0..6);
+        buffer.retransmit(0..6);
+        buffer.ack(0..6);
+        assert!(!buffer.has_unsent_data());
+        buffer.retransmit(0..6);
+        assert!(!buffer.has_unsent_data());
+        buffer.write(Bytes::from_static(b"tail"));
+        assert_eq!(buffer.poll_transmit(64).0, 6..10);
+    }
 
     #[test]
     fn fragment_with_length() {

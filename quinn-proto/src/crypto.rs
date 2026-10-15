@@ -57,6 +57,18 @@ pub trait Session: Send + Sync + 'static {
         false
     }
 
+    /// Whether a completed, authenticated early-data rejection permits retaining streams.
+    ///
+    /// This requires an actual early offer, a selected resumption PSK, no
+    /// HelloRetryRequest, and an application protocol compatible with the early
+    /// offer. Cipher compatibility must have been verified by TLS. This does not
+    /// change `early_data_accepted`, authorize application replay, or validate
+    /// transport parameters. The transport must opt in and check those separately.
+    /// Providers that cannot establish these facts must return false.
+    fn early_data_rejection_allows_stream_reuse(&self) -> bool {
+        false
+    }
+
     /// Returns `true` until the connection is fully established.
     fn is_handshaking(&self) -> bool;
 

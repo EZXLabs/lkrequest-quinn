@@ -47,6 +47,16 @@ pub struct TransportConfig {
     pub(crate) enable_ecn: bool,
     pub(crate) initial_frame_layout: Option<InitialFrameLayoutConfig>,
     pub(crate) initial_packet_chaos: bool,
+    pub(crate) stop_before_matching_reset: bool,
+    pub(crate) ack_obligation_only: bool,
+    pub(crate) reset_finished_on_stop: bool,
+    pub(crate) pto_single_probe_with_gap: bool,
+    pub(crate) chrome_pto_timing: bool,
+    pub(crate) chrome_loss_timing: bool,
+    pub(crate) reuse_rejected_0rtt_streams: bool,
+    pub(crate) chrome_rtt_quantization: bool,
+    pub(crate) queue_pto_while_blocked: bool,
+    pub(crate) discard_blocked_close: bool,
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
@@ -382,6 +392,112 @@ impl TransportConfig {
         self
     }
 
+    /// Send a pending STOP_SENDING before a RESET_STREAM with the same stream
+    /// ID and application error code in 1-RTT packets.
+    ///
+    /// Disabled by default. This local packetization option does not affect
+    /// 0-RTT packets or advertise any additional transport parameter.
+    pub fn stop_before_matching_reset(&mut self, enabled: bool) -> &mut Self {
+        self.stop_before_matching_reset = enabled;
+        self
+    }
+
+    /// Bundle ACKs in 1-RTT packets only for newly received ACK-eliciting data
+    /// or an existing immediate-ACK obligation.
+    ///
+    /// Disabled by default. When enabled, an ACK-only receive tail does not
+    /// itself request an ACK. Required ACKs, ECN feedback, and ACK ranges are
+    /// preserved; Initial, Handshake, and 0-RTT packet behavior is unchanged.
+    pub fn ack_obligation_only(&mut self, enabled: bool) -> &mut Self {
+        self.ack_obligation_only = enabled;
+        self
+    }
+
+    /// Immediately reset an application-finished send stream when a new
+    /// STOP_SENDING is received in a 1-RTT packet.
+    ///
+    /// Disabled by default. Application-finished means `finish()` was called;
+    /// FIN may still be buffered. Streams that are still writable, already
+    /// stopped/reset, or fully acknowledged retain their existing behavior.
+    pub fn reset_finished_on_stop(&mut self, enabled: bool) -> &mut Self {
+        self.reset_finished_on_stop = enabled;
+        self
+    }
+
+    /// Use one 1-RTT PTO probe and a skipped packet number to request prompt acknowledgement.
+    ///
+    /// Disabled by default. When enabled, application-data PTOs with 1-RTT keys skip one
+    /// packet number, grant one probe transmission, and do not add IMMEDIATE_ACK for that
+    /// probe. Existing ACK obligations and other sources of IMMEDIATE_ACK are preserved.
+    /// Initial, Handshake, and 0-RTT behavior is unchanged.
+    pub fn pto_single_probe_with_gap(&mut self, enabled: bool) -> &mut Self {
+        self.pto_single_probe_with_gap = enabled;
+        self
+    }
+
+    /// Use sampled, confirmed 1-RTT PTO timing with twice RTT variation and first-flight bounds.
+    /// Retain an armed recovery deadline when its requested change is strictly below one millisecond,
+    /// including transitions between PTO and time-threshold loss in the same confirmed Data space.
+    ///
+    /// Disabled by default. This changes PTO calculations and recovery-alarm update tolerance,
+    /// not RTT estimation, initial RTT, loss thresholds or other timers. Unsampled and
+    /// pre-confirmation paths retain their existing timing.
+    pub fn chrome_pto_timing(&mut self, enabled: bool) -> &mut Self {
+        self.chrome_pto_timing = enabled;
+        self
+    }
+
+    /// Use the previous smoothed and ACK-delay-adjusted latest RTT for loss timing.
+    ///
+    /// Disabled by default. The RTT input is floored at one millisecond before
+    /// applying the configured time threshold. This does not change that
+    /// threshold, the public RTT measurements, PTO timing or alarm tolerance.
+    /// Factors 5/4 and 9/8 use integer-microsecond shifted fractions when the
+    /// result fits the source's signed-microsecond range; other inputs retain
+    /// duration multiplication.
+    pub fn chrome_loss_timing(&mut self, enabled: bool) -> &mut Self {
+        self.chrome_loss_timing = enabled;
+        self
+    }
+
+    /// Preserve streams after a compatible, explicitly authorized 0-RTT rejection.
+    ///
+    /// Disabled by default. Requires the crypto provider to authorize reuse after a completed
+    /// handshake and peer transport limits compatible with the cached limits. Earlier rejection
+    /// (including HelloRetryRequest), unknown TLS state, and incompatible parameters retain the
+    /// normal stream-discard behavior. TLS early-data acceptance remains false.
+    pub fn reuse_rejected_0rtt_streams(&mut self, enabled: bool) -> &mut Self {
+        self.reuse_rejected_0rtt_streams = enabled;
+        self
+    }
+
+    /// Use Chromium's microsecond and floating-point rounding for smoothed RTT and variation.
+    ///
+    /// Disabled by default. This does not change the raw latest/minimum RTT values used by
+    /// loss detection, the initial RTT setting, or the PTO scheduling policy.
+    pub fn chrome_rtt_quantization(&mut self, enabled: bool) -> &mut Self {
+        self.chrome_rtt_quantization = enabled;
+        self
+    }
+
+    /// Queue eligible confirmed 1-RTT PTO retransmissions behind a blocked socket writer.
+    ///
+    /// Disabled by default. Already encrypted transmits retain FIFO ownership until sent or
+    /// discarded by connection termination; queueing does not authorize ordinary new data.
+    pub fn queue_pto_while_blocked(&mut self, enabled: bool) -> &mut Self {
+        self.queue_pto_while_blocked = enabled;
+        self
+    }
+
+    /// Discard unsent local application closes on confirmed client connections.
+    ///
+    /// Disabled by default. Runtime writers apply this after a close cannot be
+    /// written; handshake, server and transport-error closes retain normal behavior.
+    pub fn discard_blocked_close(&mut self, enabled: bool) -> &mut Self {
+        self.discard_blocked_close = enabled;
+        self
+    }
+
     /// Extra QUIC transport parameters to advertise during the TLS handshake.
     ///
     /// This is intended for fingerprint/profile compatibility experiments such
@@ -492,6 +608,16 @@ impl Default for TransportConfig {
             enable_ecn: true,
             initial_frame_layout: None,
             initial_packet_chaos: false,
+            stop_before_matching_reset: false,
+            ack_obligation_only: false,
+            reset_finished_on_stop: false,
+            pto_single_probe_with_gap: false,
+            chrome_pto_timing: false,
+            chrome_loss_timing: false,
+            reuse_rejected_0rtt_streams: false,
+            chrome_rtt_quantization: false,
+            queue_pto_while_blocked: false,
+            discard_blocked_close: false,
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
@@ -537,6 +663,16 @@ impl fmt::Debug for TransportConfig {
             enable_ecn,
             initial_frame_layout,
             initial_packet_chaos,
+            stop_before_matching_reset,
+            ack_obligation_only,
+            reset_finished_on_stop,
+            pto_single_probe_with_gap,
+            chrome_pto_timing,
+            chrome_loss_timing,
+            reuse_rejected_0rtt_streams,
+            chrome_rtt_quantization,
+            queue_pto_while_blocked,
+            discard_blocked_close,
             persistent_congestion_threshold,
             keep_alive_interval,
             crypto_buffer_size,
@@ -574,6 +710,16 @@ impl fmt::Debug for TransportConfig {
             .field("enable_ecn", enable_ecn)
             .field("initial_frame_layout", initial_frame_layout)
             .field("initial_packet_chaos", initial_packet_chaos)
+            .field("stop_before_matching_reset", stop_before_matching_reset)
+            .field("ack_obligation_only", ack_obligation_only)
+            .field("reset_finished_on_stop", reset_finished_on_stop)
+            .field("pto_single_probe_with_gap", pto_single_probe_with_gap)
+            .field("chrome_pto_timing", chrome_pto_timing)
+            .field("chrome_loss_timing", chrome_loss_timing)
+            .field("reuse_rejected_0rtt_streams", reuse_rejected_0rtt_streams)
+            .field("chrome_rtt_quantization", chrome_rtt_quantization)
+            .field("queue_pto_while_blocked", queue_pto_while_blocked)
+            .field("discard_blocked_close", discard_blocked_close)
             .field(
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,

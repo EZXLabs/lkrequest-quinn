@@ -59,6 +59,12 @@ impl PacketBuilder {
                     |keys| &keys.packet.local,
                 )
                 .confidentiality_limit();
+            if sent_with_keys >= confidentiality_limit {
+                conn.kill(
+                    TransportError::AEAD_LIMIT_REACHED("confidentiality limit reached").into(),
+                );
+                return None;
+            }
             if sent_with_keys.saturating_add(1) == confidentiality_limit {
                 // We still have time to attempt a graceful close
                 conn.close_inner(
@@ -69,12 +75,6 @@ impl PacketBuilder {
                         reason: Bytes::from_static(b"confidentiality limit reached"),
                     }),
                 )
-            } else if sent_with_keys > confidentiality_limit {
-                // Confidentiality limited violated and there's nothing we can do
-                conn.kill(
-                    TransportError::AEAD_LIMIT_REACHED("confidentiality limit reached").into(),
-                );
-                return None;
             }
         }
 
